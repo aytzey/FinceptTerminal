@@ -41,6 +41,27 @@ static QString card_active() {
         .arg(ui::colors::BG_SURFACE(), ui::colors::POSITIVE());
 }
 
+static bool local_pricing_enabled() {
+    return auth::AuthManager::instance().has_local_runtime();
+}
+
+static std::vector<auth::SubscriptionPlan> local_runtime_plans() {
+    auth::SubscriptionPlan local;
+    local.plan_id = "local-codex";
+    local.name = "Local Codex";
+    local.description = "Local runtime with Codex OAuth and open data providers";
+    local.price_usd = 0;
+    local.currency = "USD";
+    local.credits = 0;
+    local.support_type = "local";
+    local.validity_days = 0;
+    local.is_free = true;
+    local.display_order = 0;
+    local.features = {"Codex OAuth chat", "Local news and geopolitics analysis", "Local QuantLib subset",
+                      "Local forum and support store", "Fincept Cloud fallback disabled"};
+    return {local};
+}
+
 // ── Constructor ──────────────────────────────────────────────────────────────
 
 PricingScreen::PricingScreen(QWidget* parent) : QWidget(parent) {
@@ -142,6 +163,16 @@ void PricingScreen::showEvent(QShowEvent* event) {
     QWidget::showEvent(event);
 
     auto& auth = auth::AuthManager::instance();
+    if (local_pricing_enabled()) {
+        loading_label_->hide();
+        user_info_label_->setText("Local Codex runtime  |  Fincept billing disabled");
+        user_info_label_->show();
+        fetched_ = false;
+        fetch_plans();
+        update_footer();
+        return;
+    }
+
     if (auth.is_authenticated()) {
         // Show loading while we fetch fresh data
         loading_label_->setText("Updating plan status...");
@@ -188,6 +219,14 @@ void PricingScreen::fetch_plans() {
     fetched_ = true;
     loading_label_->show();
     error_label_->hide();
+
+    if (local_pricing_enabled()) {
+        plans_ = local_runtime_plans();
+        loading_ = false;
+        loading_label_->hide();
+        render_plan_cards();
+        return;
+    }
 
     auth::AuthApi::instance().get_subscription_plans([this](auth::ApiResponse r) {
         loading_ = false;
@@ -283,7 +322,9 @@ QWidget* PricingScreen::create_plan_card(const auth::SubscriptionPlan& plan, int
 
     bool is_popular = (plan.name == "Standard" || plan.name == "Pro");
     bool is_current = false;
-    if (auth_mgr.is_authenticated()) {
+    if (local_pricing_enabled())
+        is_current = (plan.plan_id == "local-codex");
+    else if (auth_mgr.is_authenticated()) {
         const auto& s = auth_mgr.session();
         QString user_plan = s.account_type().toLower();
         is_current = (user_plan == plan.plan_id.toLower());
@@ -450,6 +491,13 @@ QWidget* PricingScreen::create_plan_card(const auth::SubscriptionPlan& plan, int
 // ── Payment ──────────────────────────────────────────────────────────────────
 
 void PricingScreen::on_select_plan(const QString& plan_id) {
+    if (local_pricing_enabled()) {
+        Q_UNUSED(plan_id)
+        error_label_->setText("Fincept checkout is disabled in local Codex runtime.");
+        error_label_->show();
+        return;
+    }
+
     for (auto* btn : cards_container_->findChildren<QPushButton*>()) {
         if (btn->text() == "SELECT PLAN") {
             btn->setEnabled(false);
@@ -514,6 +562,8 @@ void PricingScreen::on_select_plan(const QString& plan_id) {
 void PricingScreen::poll_payment_status() {
     if (!awaiting_payment_)
         return;
+    if (local_pricing_enabled())
+        return;
 
     auto& auth = auth::AuthManager::instance();
     auth.refresh_user_data();
@@ -572,6 +622,21 @@ void PricingScreen::update_footer() {
     }
 
     auto& auth_mgr = auth::AuthManager::instance();
+    if (local_pricing_enabled()) {
+        auto* back_btn = new QPushButton("Continue to Dashboard");
+        back_btn->setCursor(Qt::PointingHandCursor);
+        back_btn->setStyleSheet(QString("QPushButton { color: %1; background: transparent; border: none; "
+                                        "font-size: 12px; %2 }"
+                                        "QPushButton:hover { color: %3; }")
+                                    .arg(ui::colors::TEXT_SECONDARY())
+                                    .arg(MF)
+                                    .arg(ui::colors::TEXT_PRIMARY()));
+        connect(back_btn, &QPushButton::clicked, this, &PricingScreen::navigate_dashboard);
+        fl->addWidget(back_btn);
+        static_cast<QVBoxLayout*>(fl)->setAlignment(back_btn, Qt::AlignCenter);
+        return;
+    }
+
     bool user_has_paid = auth_mgr.is_authenticated() && auth_mgr.session().has_paid_plan();
 
     if (user_has_paid) {
