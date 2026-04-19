@@ -2,6 +2,7 @@
 
 #include "core/logging/Logger.h"
 #include "services/equity/MarketSentimentSupport.h"
+#include "services/news/NewsService.h"
 #include "storage/cache/CacheManager.h"
 #include "storage/repositories/DataSourceRepository.h"
 
@@ -9,8 +10,10 @@
 #include <QJsonDocument>
 #include <QMap>
 #include <QNetworkReply>
+#include <QSet>
 #include <QUrlQuery>
 
+#include <algorithm>
 #include <memory>
 
 namespace fincept::services::equity {
@@ -29,6 +32,10 @@ struct PendingSnapshotRequest {
 
 QString cache_key_for_symbol(const QString& symbol, int days) {
     return QString("equity:adanos:sentiment:%1:%2").arg(symbol.toUpper(), QString::number(days));
+}
+
+QString local_cache_key_for_symbol(const QString& symbol, int days) {
+    return QString("equity:local:sentiment:%1:%2").arg(symbol.toUpper(), QString::number(days));
 }
 
 QByteArray variant_to_json_bytes(const QVariant& value) {
@@ -50,7 +57,7 @@ MarketSentimentService::MarketSentimentService(QObject* parent) : QObject(parent
 }
 
 bool MarketSentimentService::is_configured() const {
-    return load_connection().configured;
+    return true;
 }
 
 MarketSentimentService::ConnectionConfig MarketSentimentService::load_connection() const {
@@ -89,11 +96,7 @@ void MarketSentimentService::fetch_snapshot(const QString& symbol, int days, boo
 
     const auto connection = load_connection();
     if (!connection.configured) {
-        MarketSentimentSnapshot snapshot;
-        snapshot.symbol = normalized_symbol;
-        snapshot.status = "not_configured";
-        snapshot.message = "Configure Adanos Market Sentiment in Data Sources → Alternative Data to enable this view.";
-        emit snapshot_loaded(normalized_symbol, snapshot);
+        fetch_local_snapshot(normalized_symbol, days, force);
         return;
     }
 
@@ -211,6 +214,101 @@ void MarketSentimentService::fetch_snapshot(const QString& symbol, int days, boo
             }
         });
     }
+}
+
+void MarketSentimentService::fetch_local_snapshot(const QString& symbol, int days, bool force) {
+    const QString key = local_cache_key_for_symbol(symbol, days);
+    if (!force && CacheManager::instance().has(key)) {
+        const auto cached = variant_to_json_bytes(CacheManager::instance().get(key));
+        const auto doc = QJsonDocument::fromJson(cached);
+        if (doc.isObject()) {
+            auto snapshot = sentiment::snapshot_from_json(doc.object());
+            snapshot.configured = true;
+            emit snapshot_loaded(symbol, snapshot);
+            return;
+        }
+    }
+
+    fincept::services::NewsService::instance().fetch_all_news(
+        force, [this, symbol, days, key](bool ok, QVector<fincept::services::NewsArticle> articles) {
+        MarketSentimentSnapshot snapshot;
+        snapshot.symbol = symbol;
+        snapshot.configured = true;
+        snapshot.fetched_at = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+
+        QMap<QString, SentimentSourceSnapshot> sources;
+        for (const auto& source_id : sentiment::source_ids())
+            sources.insert(source_id, SentimentSourceSnapshot{source_id, sentiment::source_label(source_id)});
+
+        if (!ok) {
+            snapshot.status = "unavailable";
+            snapshot.message = "Local news sentiment could not refresh right now.";
+            snapshot.sources = sources.values().toVector();
+            emit snapshot_loaded(symbol, snapshot);
+            return;
+        }
+
+        const int64_t cutoff = QDateTime::currentSecsSinceEpoch() - static_cast<int64_t>(std::max(1, days)) * 86400;
+        int matches = 0;
+        int bullish = 0;
+        int bearish = 0;
+        int neutral = 0;
+        double weighted_score = 0.0;
+        QSet<QString> unique_sources;
+
+        for (const auto& article : articles) {
+            if (article.sort_ts > 0 && article.sort_ts < cutoff)
+                continue;
+            const QString text = (article.headline + " " + article.summary + " " + article.tickers.join(" ")).toUpper();
+            if (!article.tickers.contains(symbol, Qt::CaseInsensitive) && !text.contains(symbol))
+                continue;
+
+            ++matches;
+            unique_sources.insert(article.source);
+            const double impact_weight = article.impact == fincept::services::Impact::HIGH
+                                             ? 1.5
+                                             : article.impact == fincept::services::Impact::MEDIUM ? 1.15 : 1.0;
+            if (article.sentiment == fincept::services::Sentiment::BULLISH) {
+                ++bullish;
+                weighted_score += impact_weight;
+            } else if (article.sentiment == fincept::services::Sentiment::BEARISH) {
+                ++bearish;
+                weighted_score -= impact_weight;
+            } else {
+                ++neutral;
+            }
+        }
+
+        auto news = sources.value("news");
+        news.available = matches > 0;
+        news.activity_count = matches;
+        news.buzz_score = std::min(100.0, matches * 8.0 + unique_sources.size() * 6.0);
+        news.bullish_pct = matches > 0 ? 100.0 * bullish / matches : 0.0;
+        news.sentiment_score = matches > 0 ? weighted_score / matches : 0.0;
+        sources.insert("news", news);
+
+        snapshot.sources = sources.values().toVector();
+        snapshot.coverage = news.available ? 1 : 0;
+        snapshot.source_alignment = sentiment::compute_source_alignment(snapshot.sources);
+        snapshot.average_buzz = news.available ? news.buzz_score : 0.0;
+        snapshot.average_bullish_pct = news.available ? news.bullish_pct : 0.0;
+        snapshot.available = news.available;
+        snapshot.status = news.available ? "ok" : "unavailable";
+        snapshot.message = news.available
+                               ? QString("Local news sentiment from %1 matching articles (%2 bullish, %3 bearish, %4 neutral).")
+                                     .arg(matches)
+                                     .arg(bullish)
+                                     .arg(bearish)
+                                     .arg(neutral)
+                               : "No local news sentiment snapshot is available for this symbol yet.";
+
+        CacheManager::instance().put(
+            key,
+            QVariant(QJsonDocument(sentiment::snapshot_to_json(snapshot)).toJson(QJsonDocument::Compact)),
+            kCacheTtlSec,
+            "equity");
+        emit snapshot_loaded(symbol, snapshot);
+    });
 }
 
 } // namespace fincept::services::equity

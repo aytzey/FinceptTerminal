@@ -85,9 +85,10 @@ QJsonArray first_array_payload(const QJsonValue& value) {
     if (!value.isObject())
         return {};
     const QJsonObject obj = value.toObject();
-    for (const QString& key : {"vessels", "results", "data", "tracks", "positions", "history", "features"}) {
-        if (obj.value(key).isArray())
-            return obj.value(key).toArray();
+    for (const char* key : {"vessels", "results", "data", "tracks", "positions", "history", "features"}) {
+        const QString field = QString::fromLatin1(key);
+        if (obj.value(field).isArray())
+            return obj.value(field).toArray();
     }
     return {};
 }
@@ -97,9 +98,10 @@ QJsonObject first_object_payload(const QJsonValue& value) {
         const QJsonObject obj = value.toObject();
         if (obj.contains("error"))
             return {};
-        for (const QString& key : {"vessel", "data", "result"}) {
-            if (obj.value(key).isObject())
-                return obj.value(key).toObject();
+        for (const char* key : {"vessel", "data", "result"}) {
+            const QString field = QString::fromLatin1(key);
+            if (obj.value(field).isObject())
+                return obj.value(field).toObject();
         }
         const QJsonArray arr = first_array_payload(obj);
         if (!arr.isEmpty() && arr.first().isObject())

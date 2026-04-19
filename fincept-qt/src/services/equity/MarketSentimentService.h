@@ -30,6 +30,7 @@ class MarketSentimentService : public QObject {
     };
 
     ConnectionConfig load_connection() const;
+    void fetch_local_snapshot(const QString& symbol, int days, bool force);
 
     QNetworkRequest build_request(const QUrl& url, const QString& api_key) const;
 

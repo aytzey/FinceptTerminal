@@ -160,7 +160,7 @@ void EquitySentimentTab::build_ui() {
     header_layout->addWidget(refresh_button);
     root->addWidget(header);
 
-    status_label_ = new QLabel("Open a symbol and enable Adanos Market Sentiment in Data Sources to load a snapshot.");
+    status_label_ = new QLabel("Open a symbol to load local news sentiment. External sentiment providers are optional.");
     status_label_->setAlignment(Qt::AlignCenter);
     status_label_->setStyleSheet(
         QString("color:%1; font-size:12px; padding:20px; background:transparent;").arg(ui::colors::TEXT_SECONDARY()));
