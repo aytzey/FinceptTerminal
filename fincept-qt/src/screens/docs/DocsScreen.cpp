@@ -1051,9 +1051,10 @@ QWidget* DocsScreen::page_geopolitics() {
         "GEOPOLITICS", "Conflict monitoring, HDX data, trade analysis, and relationship mapping",
         {
             {"OVERVIEW", "The Geopolitics screen provides a comprehensive view of global geopolitical events "
-                         "with conflict monitoring, humanitarian data (HDX), trade flow analysis, and entity "
+                         "with local news/model event extraction, a persistent event archive, humanitarian data (HDX), trade flow analysis, and entity "
                          "relationship mapping for understanding geopolitical dynamics."},
             {"KEY FEATURES", "■  Conflict monitor — Active global conflicts with severity tracking\n"
+                             "■  Local event archive — Deduplicated geopolitics events retained in cache.db\n"
                              "■  HDX integration — Humanitarian Data Exchange for crisis data\n"
                              "■  Trade analysis — Sanctions, tariffs, trade flow disruptions\n"
                              "■  Relationship mapping — Entity relationships and influence networks\n"
