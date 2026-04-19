@@ -8,10 +8,7 @@
 
 #include <QDateTime>
 #include <QHBoxLayout>
-#include <QNetworkReply>
-#include <QNetworkRequest>
 #include <QPalette>
-#include <QUrl>
 
 namespace {
 
@@ -119,10 +116,9 @@ DashboardStatusBar::DashboardStatusBar(QWidget* parent) : QWidget(parent) {
     connect(&uptime_timer_, &QTimer::timeout, this, &DashboardStatusBar::update_uptime);
     uptime_timer_.start(1000);
 
-    nam_ = new QNetworkAccessManager(this);
-    connect(&ping_timer_, &QTimer::timeout, this, &DashboardStatusBar::ping_api);
-    ping_timer_.start(30000);
-    ping_api();
+    connect(&runtime_status_timer_, &QTimer::timeout, this, &DashboardStatusBar::update_runtime_status);
+    runtime_status_timer_.start(30000);
+    update_runtime_status();
 
     refresh_theme();
 }
@@ -178,34 +174,17 @@ void DashboardStatusBar::set_connected(bool connected) {
                                     .arg(connected ? ui::colors::POSITIVE() : ui::colors::NEGATIVE()));
 }
 
-void DashboardStatusBar::ping_api() {
+void DashboardStatusBar::update_runtime_status() {
     if (auth::AuthManager::instance().has_local_runtime()) {
-        latency_label_->setText("LAT: LOCAL");
+        latency_label_->setText("RT: CODEX");
         latency_label_->setStyleSheet(
             QString("color:%1;font-weight:bold;background:transparent;").arg(ui::colors::POSITIVE()));
         return;
     }
 
-    QNetworkRequest req(QUrl("https://api.fincept.in/health"));
-    req.setTransferTimeout(5000);
-    ping_elapsed_.restart();
-    QNetworkReply* reply = nam_->get(req);
-    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
-        reply->deleteLater();
-        set_latency(reply->error() == QNetworkReply::NoError ? static_cast<int>(ping_elapsed_.elapsed()) : -1);
-    });
-}
-
-void DashboardStatusBar::set_latency(int ms) {
-    if (ms < 0) {
-        latency_label_->setText("LAT: ERR");
-        latency_label_->setStyleSheet(
-            QString("color:%1;font-weight:bold;background:transparent;").arg(ui::colors::NEGATIVE()));
-        return;
-    }
-    latency_label_->setText(QString("LAT: %1ms").arg(ms));
-    const QString color = ms < 100 ? ui::colors::POSITIVE() : ms < 300 ? ui::colors::AMBER() : ui::colors::NEGATIVE();
-    latency_label_->setStyleSheet(QString("color:%1;font-weight:bold;background:transparent;").arg(color));
+    latency_label_->setText(auth::AuthManager::instance().is_authenticated() ? "RT: CLOUD" : "RT: LOCAL");
+    latency_label_->setStyleSheet(
+        QString("color:%1;font-weight:bold;background:transparent;").arg(ui::colors::TEXT_SECONDARY()));
 }
 
 void DashboardStatusBar::toggle_notif_panel() {

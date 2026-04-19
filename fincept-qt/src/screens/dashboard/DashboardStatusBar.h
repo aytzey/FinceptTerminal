@@ -1,7 +1,5 @@
 #pragma once
-#include <QElapsedTimer>
 #include <QLabel>
-#include <QNetworkAccessManager>
 #include <QShowEvent>
 #include <QTimer>
 #include <QWidget>
@@ -31,8 +29,7 @@ class DashboardStatusBar : public QWidget {
   private:
     void refresh_theme();
     void update_uptime();
-    void ping_api();
-    void set_latency(int ms); // -1 = timeout/error
+    void update_runtime_status();
     void toggle_notif_panel();
 
     QLabel* uptime_label_ = nullptr;
@@ -44,9 +41,7 @@ class DashboardStatusBar : public QWidget {
     fincept::ui::NotifPanel* notif_panel_ = nullptr;
 
     QTimer uptime_timer_;
-    QTimer ping_timer_;
-    QNetworkAccessManager* nam_ = nullptr;
-    QElapsedTimer ping_elapsed_;
+    QTimer runtime_status_timer_;
 
     qint64 start_time_ = 0;
     bool connected_ = true;
