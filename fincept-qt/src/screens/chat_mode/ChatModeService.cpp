@@ -1274,6 +1274,10 @@ void ChatModeService::list_tasks(TasksCallback cb) {
 
 void ChatModeService::create_task(const QString& query, const QString& session_id, TaskCallback cb) {
     if (local_chat_mode_enabled()) {
+        if (!ai_chat::LlmService::instance().is_configured()) {
+            cb(false, {}, "No local LLM provider configured. Connect Codex OAuth or set an LLM provider.");
+            return;
+        }
         QString error;
         QJsonObject store = load_local_store(&error);
         QJsonArray tasks = store.value("tasks").toArray();
@@ -1525,7 +1529,7 @@ void ChatModeService::handle_task_sse_line(const QByteArray& line) {
 
 void ChatModeService::get_credits(CreditsCallback cb) {
     if (local_chat_mode_enabled()) {
-        cb(true, 0, {});
+        cb(true, -1, {});
         return;
     }
     const QString path = QString("/user/profile?_t=%1").arg(QDateTime::currentMSecsSinceEpoch());

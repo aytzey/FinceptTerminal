@@ -1,6 +1,5 @@
 #include "screens/chat_mode/ChatAgentPanel.h"
 
-#include "auth/AuthManager.h"
 #include "core/logging/Logger.h"
 #include "screens/chat_mode/ChatModeService.h"
 #include "ui/theme/Theme.h"
@@ -15,18 +14,6 @@
 namespace fincept::chat_mode {
 
 namespace {
-
-bool cloud_features_available() {
-    auto& auth = auth::AuthManager::instance();
-    return auth.has_local_runtime() || auth.has_fincept_api_key();
-}
-
-void add_placeholder_item(QListWidget* list, const QString& text) {
-    list->clear();
-    auto* item = new QListWidgetItem(text);
-    item->setFlags(item->flags() & ~Qt::ItemIsEnabled);
-    list->addItem(item);
-}
 
 } // namespace
 
@@ -60,15 +47,11 @@ static QString hint_ss() {
 
 ChatAgentPanel::ChatAgentPanel(QWidget* parent) : QWidget(parent) {
     build_ui();
-    if (cloud_features_available()) {
-        refresh_memory();
-        refresh_schedules();
-        refresh_tasks();
-        refresh_mcp_servers();
-        refresh_monitors();
-    } else {
-        show_local_mode_placeholders();
-    }
+    refresh_memory();
+    refresh_schedules();
+    refresh_tasks();
+    refresh_mcp_servers();
+    refresh_monitors();
 }
 
 // ── Build UI ──────────────────────────────────────────────────────────────────
@@ -345,10 +328,6 @@ void ChatAgentPanel::on_tab_changed(int index) {
 // ── Refresh methods ───────────────────────────────────────────────────────────
 
 void ChatAgentPanel::refresh_memory() {
-    if (!cloud_features_available()) {
-        show_local_mode_placeholders();
-        return;
-    }
     mem_add_btn_->setEnabled(true);
     mem_del_btn_->setEnabled(false);
     mem_clear_btn_->setEnabled(true);
@@ -377,10 +356,6 @@ void ChatAgentPanel::refresh_memory() {
 }
 
 void ChatAgentPanel::refresh_schedules() {
-    if (!cloud_features_available()) {
-        show_local_mode_placeholders();
-        return;
-    }
     sched_add_btn_->setEnabled(true);
     sched_del_btn_->setEnabled(false);
     sched_toggle_btn_->setEnabled(false);
@@ -411,10 +386,6 @@ void ChatAgentPanel::refresh_schedules() {
 }
 
 void ChatAgentPanel::refresh_tasks() {
-    if (!cloud_features_available()) {
-        show_local_mode_placeholders();
-        return;
-    }
     task_refresh_btn_->setEnabled(true);
     task_detail_btn_->setEnabled(false);
     task_feedback_btn_->setEnabled(false);
@@ -457,10 +428,6 @@ void ChatAgentPanel::refresh_tasks() {
 }
 
 void ChatAgentPanel::refresh_mcp_servers() {
-    if (!cloud_features_available()) {
-        show_local_mode_placeholders();
-        return;
-    }
     mcp_add_btn_->setEnabled(true);
     mcp_del_btn_->setEnabled(false);
     mcp_refresh_btn_->setEnabled(true);
@@ -499,10 +466,6 @@ void ChatAgentPanel::refresh_mcp_servers() {
 }
 
 void ChatAgentPanel::refresh_monitors() {
-    if (!cloud_features_available()) {
-        show_local_mode_placeholders();
-        return;
-    }
     mon_add_btn_->setEnabled(true);
     mon_del_btn_->setEnabled(false);
     mon_toggle_btn_->setEnabled(false);
@@ -532,40 +495,6 @@ void ChatAgentPanel::refresh_monitors() {
                 item->setForeground(QColor(ui::colors::POSITIVE()));
         }
     });
-}
-
-void ChatAgentPanel::show_local_mode_placeholders() {
-    memories_.clear();
-    schedules_.clear();
-    tasks_.clear();
-    mcp_servers_.clear();
-    monitors_.clear();
-
-    add_placeholder_item(memory_list_, "Connect Codex OAuth or Fincept API.");
-    add_placeholder_item(sched_list_, "Connect Codex OAuth or Fincept API.");
-    add_placeholder_item(task_list_, "Connect Codex OAuth or Fincept API.");
-    add_placeholder_item(mcp_list_, "Connect Codex OAuth or Fincept API.");
-    add_placeholder_item(monitor_list_, "Connect Codex OAuth or Fincept API.");
-
-    task_status_lbl_->setText("Agent features need Codex OAuth or a Fincept API key.");
-    mcp_tools_lbl_->setText("Connect Codex OAuth or Fincept API.");
-
-    mem_add_btn_->setEnabled(false);
-    mem_del_btn_->setEnabled(false);
-    mem_clear_btn_->setEnabled(false);
-    sched_add_btn_->setEnabled(false);
-    sched_del_btn_->setEnabled(false);
-    sched_toggle_btn_->setEnabled(false);
-    task_refresh_btn_->setEnabled(false);
-    task_detail_btn_->setEnabled(false);
-    task_feedback_btn_->setEnabled(false);
-    task_cancel_btn_->setEnabled(false);
-    mcp_add_btn_->setEnabled(false);
-    mcp_del_btn_->setEnabled(false);
-    mcp_refresh_btn_->setEnabled(false);
-    mon_add_btn_->setEnabled(false);
-    mon_del_btn_->setEnabled(false);
-    mon_toggle_btn_->setEnabled(false);
 }
 
 // ── Memory actions ────────────────────────────────────────────────────────────

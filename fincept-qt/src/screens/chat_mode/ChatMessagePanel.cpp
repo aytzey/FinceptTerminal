@@ -1,5 +1,6 @@
 #include "screens/chat_mode/ChatMessagePanel.h"
 
+#include "auth/AuthManager.h"
 #include "screens/chat_mode/ChatModeService.h"
 #include "ui/markdown/MarkdownRenderer.h"
 #include "ui/theme/Theme.h"
@@ -616,7 +617,7 @@ void ChatMessagePanel::on_stream_error(const QString& message) {
 void ChatMessagePanel::on_stream_heartbeat() {}
 
 void ChatMessagePanel::on_insufficient_credits() {
-    on_stream_error("Insufficient credits. Top up to continue.");
+    on_stream_error("Remote credit limit reached. Local Codex mode does not use Fincept credits.");
 }
 
 void ChatMessagePanel::on_tools_registered(int count) {
@@ -624,10 +625,13 @@ void ChatMessagePanel::on_tools_registered(int count) {
 }
 
 void ChatMessagePanel::set_credits(int credits) {
-    if (credits > 0)
+    if (credits < 0) {
+        hdr_credits_lbl_->setText(auth::AuthManager::instance().has_local_runtime() ? "CODEX" : "LOCAL");
+    } else if (credits > 0) {
         hdr_credits_lbl_->setText(QString("%1 credits").arg(QLocale(QLocale::English).toString(credits)));
-    else
+    } else {
         hdr_credits_lbl_->setText("0 credits");
+    }
 }
 
 // ── Send / Optimize ──────────────────────────────────────────────────────────
