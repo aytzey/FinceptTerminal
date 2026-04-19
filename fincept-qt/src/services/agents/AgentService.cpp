@@ -118,13 +118,13 @@ QJsonObject AgentService::build_api_keys() const {
         }
     }
 
-    // Always include Fincept session API key (from login) so agents can use
-    // the fincept provider even if user hasn't manually configured it in Settings.
+    // Always include the active Fincept API key so agents can reach Fincept
+    // services even in local Codex mode with a standalone key.
     if (!keys.contains("fincept")) {
-        const auto& session = auth::AuthManager::instance().session();
-        if (!session.api_key.isEmpty()) {
-            keys["fincept"] = session.api_key;
-            keys["FINCEPT_API_KEY"] = session.api_key;
+        const QString fincept_api_key = auth::AuthManager::instance().effective_api_key();
+        if (!fincept_api_key.isEmpty()) {
+            keys["fincept"] = fincept_api_key;
+            keys["FINCEPT_API_KEY"] = fincept_api_key;
         }
     }
 

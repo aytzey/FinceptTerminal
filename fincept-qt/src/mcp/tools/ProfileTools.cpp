@@ -132,12 +132,14 @@ std::vector<ToolDef> get_profile_tools() {
         t.category = "profile";
         t.input_schema.properties = QJsonObject{};
         t.handler = [](const QJsonObject&) -> ToolResult {
-            const auto& sess = AuthManager::instance().session();
+            auto& auth = AuthManager::instance();
+            const auto& sess = auth.session();
             if (!sess.authenticated)
                 return ToolResult::fail("Not authenticated");
-            if (sess.api_key.isEmpty())
+            const QString api_key = auth.effective_api_key();
+            if (api_key.isEmpty())
                 return ToolResult::fail("No API key in session");
-            return ToolResult::ok_data(QJsonObject{{"api_key", sess.api_key}});
+            return ToolResult::ok_data(QJsonObject{{"api_key", api_key}});
         };
         tools.push_back(std::move(t));
     }

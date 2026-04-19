@@ -13,7 +13,7 @@ SessionGuard::SessionGuard(QObject* parent) : QObject(parent) {
 
     connect(&AuthManager::instance(), &AuthManager::auth_state_changed, this, [this]() {
         const auto& s = AuthManager::instance().session();
-        if (s.authenticated && !s.api_key.isEmpty()) {
+        if (s.authenticated && AuthManager::instance().has_fincept_api_key()) {
             start();
         } else {
             stop();
@@ -34,7 +34,7 @@ void SessionGuard::stop() {
 
 void SessionGuard::check_pulse() {
     const auto& s = AuthManager::instance().session();
-    if (!s.authenticated || s.api_key.isEmpty())
+    if (!s.authenticated || !AuthManager::instance().has_fincept_api_key())
         return;
     if (is_checking_)
         return;

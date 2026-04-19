@@ -355,7 +355,7 @@ QWidget* ProfileScreen::build_security() {
     connect(sb, &QPushButton::clicked, this, [this, sb]() {
         api_key_visible_ = !api_key_visible_;
         sb->setText(api_key_visible_ ? "HIDE" : "SHOW");
-        sec_api_key_->setText(api_key_visible_ ? auth::AuthManager::instance().session().api_key
+        sec_api_key_->setText(api_key_visible_ ? auth::AuthManager::instance().effective_api_key()
                                                : QString(20, QChar(0x2022)));
     });
     krl->addWidget(sb);
@@ -366,7 +366,7 @@ QWidget* ProfileScreen::build_security() {
                 "font-size:10px;font-weight:700;font-family:'Consolas',monospace;}QPushButton:hover{color:%4;}")
             .arg(ui::colors::BG_RAISED(), ui::colors::TEXT_SECONDARY(), ui::colors::BORDER_DIM(), ui::colors::TEXT_PRIMARY()));
     connect(cb, &QPushButton::clicked, this, [cb]() {
-        auto key = auth::AuthManager::instance().session().api_key;
+        auto key = auth::AuthManager::instance().effective_api_key();
         if (!key.isEmpty()) {
             QApplication::clipboard()->setText(key);
             cb->setText("COPIED");

@@ -18,7 +18,7 @@ namespace {
 
 bool cloud_features_available() {
     auto& auth = auth::AuthManager::instance();
-    return auth.is_authenticated() && !auth.is_local_mode() && !auth.session().api_key.isEmpty();
+    return auth.has_fincept_api_key();
 }
 
 void add_placeholder_item(QListWidget* list, const QString& text) {

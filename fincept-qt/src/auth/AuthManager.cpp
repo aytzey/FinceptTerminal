@@ -40,6 +40,14 @@ AuthManager& AuthManager::instance() {
 
 AuthManager::AuthManager() {}
 
+bool AuthManager::has_fincept_api_key() const {
+    return !session_.api_key.isEmpty();
+}
+
+QString AuthManager::effective_api_key() const {
+    return session_.api_key;
+}
+
 void AuthManager::set_loading(bool v) {
     if (is_loading_ != v) {
         is_loading_ = v;
@@ -114,6 +122,14 @@ void AuthManager::load_session() {
         if (session_.api_key.isEmpty() || session_.api_key != secure_key.value()) {
             LOG_INFO("Auth", "Restored api_key from SecureStorage");
             session_.api_key = secure_key.value();
+        }
+    }
+
+    if (session_.api_key.isEmpty()) {
+        auto stored_key = fincept::SettingsRepository::instance().get("fincept_api_key");
+        if (stored_key.is_ok() && !stored_key.value().trimmed().isEmpty()) {
+            LOG_INFO("Auth", "Restored api_key from settings");
+            session_.api_key = stored_key.value().trimmed();
         }
     }
 

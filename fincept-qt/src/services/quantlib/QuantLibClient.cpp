@@ -69,8 +69,9 @@ static QNetworkRequest build_request(const QString& endpoint, const QJsonObject&
     req.setRawHeader("User-Agent", "FinceptTerminal/4.0.0");
 
     auto& auth_mgr = auth::AuthManager::instance();
-    if (auth_mgr.is_authenticated())
-        req.setRawHeader("X-API-Key", auth_mgr.session().api_key.toUtf8());
+    const QString fincept_api_key = auth_mgr.effective_api_key();
+    if (!fincept_api_key.isEmpty())
+        req.setRawHeader("X-API-Key", fincept_api_key.toUtf8());
 
     return req;
 }

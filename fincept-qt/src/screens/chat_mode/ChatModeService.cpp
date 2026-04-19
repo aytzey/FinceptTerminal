@@ -34,7 +34,7 @@ QString ChatModeService::base_url() const {
 }
 
 QString ChatModeService::api_key() const {
-    return auth::AuthManager::instance().session().api_key;
+    return auth::AuthManager::instance().effective_api_key();
 }
 
 QString ChatModeService::session_token() const {

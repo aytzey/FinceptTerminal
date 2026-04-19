@@ -866,11 +866,12 @@ void MainWindow::setup_dock_screens() {
     dock_router_->register_factory("crypto_trading", []() { return new screens::CryptoTradingScreen; });
     dock_router_->register_factory("news", []() { return new screens::NewsScreen; });
     dock_router_->register_factory("forum", []() -> QWidget* {
-        if (auth::AuthManager::instance().is_local_mode()) {
+        auto& auth = auth::AuthManager::instance();
+        if (auth.is_local_mode() && !auth.has_fincept_api_key()) {
             return make_cloud_feature_notice(
                 "FORUM",
-                "This screen depends on Fincept Cloud. Local Codex mode keeps terminal and AI Chat available without a "
-                "Fincept account.");
+                "Local Codex mode is active. Add a Fincept API key to unlock the community forum without switching out "
+                "of the local workflow.");
         }
         return new screens::ForumScreen;
     });
@@ -879,11 +880,12 @@ void MainWindow::setup_dock_screens() {
     // Lazily constructed on first navigation — deferred to avoid startup cost.
     dock_router_->register_factory("report_builder", []() { return new screens::ReportBuilderScreen; });
     dock_router_->register_factory("profile", []() -> QWidget* {
-        if (auth::AuthManager::instance().is_local_mode()) {
+        auto& auth = auth::AuthManager::instance();
+        if (auth.is_local_mode() && !auth.has_fincept_api_key()) {
             return make_cloud_feature_notice(
                 "PROFILE",
-                "Local Codex mode is active. Sign in to Fincept Cloud to use account profile, billing, and community "
-                "features.");
+                "Local Codex mode is active. Add a Fincept API key to load profile, billing, usage, and account data "
+                "without a Fincept login flow.");
         }
         return new screens::ProfileScreen;
     });

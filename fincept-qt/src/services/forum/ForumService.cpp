@@ -30,7 +30,7 @@ ForumService::ForumService() {
 }
 
 QString ForumService::api_key() const {
-    return auth::AuthManager::instance().session().api_key;
+    return auth::AuthManager::instance().effective_api_key();
 }
 
 // ── Low-level HTTP helpers ────────────────────────────────────────────────────
@@ -401,4 +401,3 @@ void ForumService::update_profile(const QString& display_name, const QString& bi
 }
 
 } // namespace fincept::services
-
