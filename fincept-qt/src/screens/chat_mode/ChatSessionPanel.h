@@ -55,6 +55,7 @@ class ChatSessionPanel : public QWidget {
     void build_ui();
     void apply_filter(const QString& text);
     void populate_list(const QVector<ChatSession>& sessions);
+    void show_local_mode_placeholder();
 };
 
 } // namespace fincept::chat_mode

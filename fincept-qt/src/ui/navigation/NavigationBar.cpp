@@ -93,7 +93,18 @@ void NavigationBar::update_clock() {
 }
 
 void NavigationBar::refresh_user_display() {
-    const auto& s = auth::AuthManager::instance().session();
+    auto& auth_mgr = auth::AuthManager::instance();
+    const auto& s = auth_mgr.session();
+    if (auth_mgr.is_local_mode()) {
+        user_label_->setText("LOCAL");
+        credits_label_->setText("CODEX");
+        credits_label_->setStyleSheet(QString("color:%1;background:transparent;").arg(colors::POSITIVE.get()));
+        plan_label_->setText("GPT-5.4");
+        logout_btn_->setVisible(false);
+        return;
+    }
+
+    logout_btn_->setVisible(s.authenticated);
     if (!s.authenticated) {
         user_label_->setText("---");
         credits_label_->setText("---");

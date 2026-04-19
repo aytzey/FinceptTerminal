@@ -3,6 +3,9 @@
 #include "core/logging/Logger.h"
 #include "storage/sqlite/migrations/MigrationRunner.h"
 
+#include <QDir>
+#include <QFileInfo>
+
 namespace fincept {
 
 Database& Database::instance() {
@@ -11,6 +14,12 @@ Database& Database::instance() {
 }
 
 Result<void> Database::open(const QString& path) {
+    const QFileInfo db_file(path);
+    if (!db_file.absolutePath().isEmpty() && !QDir().mkpath(db_file.absolutePath())) {
+        return Result<void>::err(QString("Failed to create database directory: %1").arg(db_file.absolutePath())
+                                     .toStdString());
+    }
+
     db_ = QSqlDatabase::addDatabase("QSQLITE", "fincept_main");
     db_.setDatabaseName(path);
     if (!db_.open()) {

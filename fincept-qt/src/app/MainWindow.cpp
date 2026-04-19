@@ -105,9 +105,33 @@ namespace fincept {
 
 namespace {
 
-bool dev_skip_auth_enabled() {
-    const QByteArray raw = qgetenv("FINCEPT_DEV_SKIP_AUTH").trimmed().toLower();
-    return raw == "1" || raw == "true" || raw == "yes" || raw == "on";
+bool local_mode_enabled() {
+    return auth::AuthManager::instance().is_local_mode();
+}
+
+QWidget* make_cloud_feature_notice(const QString& title, const QString& detail) {
+    auto* panel = new QWidget;
+    panel->setStyleSheet(QString("background:%1;").arg(ui::colors::BG_BASE()));
+
+    auto* layout = new QVBoxLayout(panel);
+    layout->setContentsMargins(40, 40, 40, 40);
+    layout->setSpacing(14);
+    layout->addStretch();
+
+    auto* title_label = new QLabel(title, panel);
+    title_label->setAlignment(Qt::AlignCenter);
+    title_label->setStyleSheet(
+        QString("color:%1;font-size:24px;font-weight:700;letter-spacing:1px;").arg(ui::colors::AMBER()));
+    layout->addWidget(title_label);
+
+    auto* detail_label = new QLabel(detail, panel);
+    detail_label->setAlignment(Qt::AlignCenter);
+    detail_label->setWordWrap(true);
+    detail_label->setStyleSheet(QString("color:%1;font-size:14px;line-height:1.4;").arg(ui::colors::TEXT_SECONDARY()));
+    layout->addWidget(detail_label);
+
+    layout->addStretch();
+    return panel;
 }
 
 } // namespace
@@ -520,6 +544,11 @@ MainWindow::MainWindow(int window_id, QWidget* parent) : QMainWindow(parent), wi
 
     // Toolbar plan label → pricing screen
     connect(toolbar, &ui::ToolBar::plan_clicked, this, [this]() {
+        if (auth::AuthManager::instance().is_local_mode()) {
+            stack_->setCurrentIndex(1);
+            dock_router_->navigate("ai_chat", true);
+            return;
+        }
         set_shell_visible(false);
         stack_->setCurrentIndex(0);
         auth_stack_->setCurrentIndex(3); // PricingScreen
@@ -613,13 +642,16 @@ MainWindow::MainWindow(int window_id, QWidget* parent) : QMainWindow(parent), wi
     };
 
     auto& auth_mgr = auth::AuthManager::instance();
-    if (dev_skip_auth_enabled()) {
-        LOG_INFO("MainWindow", "FINCEPT_DEV_SKIP_AUTH enabled — bypassing auth, PIN, and pricing gates");
+    if (local_mode_enabled()) {
+        LOG_INFO("MainWindow", "Local Codex mode enabled — bypassing Fincept auth, PIN, and pricing gates");
+        chat_mode_ = false;
         locked_ = false;
         pin_gate_cleared_ = true;
         auth::InactivityGuard::instance().set_enabled(false);
         set_shell_visible(true);
         stack_->setCurrentIndex(1);
+        if (!WorkspaceManager::instance().has_current_workspace())
+            WorkspaceManager::instance().load_last_workspace();
         restore_last_focused_screen();
     } else if (auth_mgr.is_authenticated() || auth_mgr.is_loading()) {
         // If user is authenticated and has a PIN, show lock screen first.
@@ -666,6 +698,26 @@ MainWindow::MainWindow(int window_id, QWidget* parent) : QMainWindow(parent), wi
 
 void MainWindow::toggle_chat_mode() {
     if (locked_) return;
+
+    if (auth::AuthManager::instance().is_local_mode()) {
+        chat_mode_ = false;
+        set_shell_visible(true);
+        stack_->setCurrentIndex(1);
+        if (dock_router_)
+            dock_router_->navigate("ai_chat", true);
+        if (chat_bubble_) {
+            auto r = SettingsRepository::instance().get("appearance.show_chat_bubble");
+            const bool show = !r.is_ok() || r.value() != "false";
+            chat_bubble_->setVisible(show);
+            if (show) {
+                chat_bubble_->reposition();
+                chat_bubble_->raise();
+            }
+        }
+        LOG_INFO("MainWindow", "Local Codex mode — routed chat toggle to AI Chat");
+        return;
+    }
+
     chat_mode_ = !chat_mode_;
 
     if (chat_mode_) {
@@ -813,12 +865,28 @@ void MainWindow::setup_dock_screens() {
     dock_router_->register_factory("markets", []() { return new screens::MarketsScreen; });
     dock_router_->register_factory("crypto_trading", []() { return new screens::CryptoTradingScreen; });
     dock_router_->register_factory("news", []() { return new screens::NewsScreen; });
-    dock_router_->register_factory("forum", []() { return new screens::ForumScreen; });
+    dock_router_->register_factory("forum", []() -> QWidget* {
+        if (auth::AuthManager::instance().is_local_mode()) {
+            return make_cloud_feature_notice(
+                "FORUM",
+                "This screen depends on Fincept Cloud. Local Codex mode keeps terminal and AI Chat available without a "
+                "Fincept account.");
+        }
+        return new screens::ForumScreen;
+    });
     dock_router_->register_factory("watchlist", []() { return new screens::WatchlistScreen; });
 
     // Lazily constructed on first navigation — deferred to avoid startup cost.
     dock_router_->register_factory("report_builder", []() { return new screens::ReportBuilderScreen; });
-    dock_router_->register_factory("profile", []() { return new screens::ProfileScreen; });
+    dock_router_->register_factory("profile", []() -> QWidget* {
+        if (auth::AuthManager::instance().is_local_mode()) {
+            return make_cloud_feature_notice(
+                "PROFILE",
+                "Local Codex mode is active. Sign in to Fincept Cloud to use account profile, billing, and community "
+                "features.");
+        }
+        return new screens::ProfileScreen;
+    });
     dock_router_->register_factory("settings", []() { return new screens::SettingsScreen; });
     dock_router_->register_factory("about", []() { return new screens::AboutScreen; });
     dock_router_->register_factory("support", []() { return new screens::SupportScreen; });
@@ -876,18 +944,30 @@ void MainWindow::setup_navigation() {}
 void MainWindow::on_auth_state_changed() {
     auto& auth = auth::AuthManager::instance();
 
-    if (dev_skip_auth_enabled()) {
+    if (local_mode_enabled()) {
         locked_ = false;
+        chat_mode_ = false;
         pin_gate_cleared_ = true;
         auth::InactivityGuard::instance().set_enabled(false);
         set_shell_visible(true);
-        if (stack_->currentIndex() != 1 && stack_->currentIndex() != 2)
-            stack_->setCurrentIndex(1);
+        stack_->setCurrentIndex(1);
+
+        if (chat_bubble_) {
+            auto r = SettingsRepository::instance().get("appearance.show_chat_bubble");
+            const bool show = !r.is_ok() || r.value() != "false";
+            chat_bubble_->setVisible(show);
+            if (show) {
+                chat_bubble_->reposition();
+                chat_bubble_->raise();
+            }
+        }
 
         const QString current = dock_router_->current_screen_id();
         if (current.isEmpty())
             dock_router_->navigate(SessionManager::instance().last_screen().isEmpty() ? "dashboard"
                                                                                       : SessionManager::instance().last_screen());
+        if (!WorkspaceManager::instance().has_current_workspace())
+            WorkspaceManager::instance().load_last_workspace();
         return;
     }
 

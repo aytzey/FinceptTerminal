@@ -11,11 +11,27 @@
 
 #include <QCryptographicHash>
 #include <QDateTime>
+#include <QDir>
+#include <QFileInfo>
 #include <QJsonDocument>
 #include <QRandomGenerator>
 #include <QSysInfo>
 
 namespace fincept::auth {
+
+namespace {
+
+bool env_flag_enabled(const char* name) {
+    const QByteArray raw = qgetenv(name).trimmed().toLower();
+    return raw == "1" || raw == "true" || raw == "yes" || raw == "on";
+}
+
+bool codex_auth_file_exists() {
+    const QFileInfo info(QDir(QDir::homePath()).filePath(".codex/auth.json"));
+    return info.exists() && info.isFile();
+}
+
+} // namespace
 
 AuthManager& AuthManager::instance() {
     static AuthManager s;
@@ -121,6 +137,14 @@ void AuthManager::clear_session() {
 
 bool AuthManager::needs_pin_setup() const {
     return session_.authenticated && !PinManager::instance().has_pin();
+}
+
+bool AuthManager::has_local_runtime() const {
+    return env_flag_enabled("FINCEPT_DEV_SKIP_AUTH") || codex_auth_file_exists();
+}
+
+bool AuthManager::is_local_mode() const {
+    return has_local_runtime() && (!session_.authenticated || !session_.has_paid_plan());
 }
 
 // ── Initialize ───────────────────────────────────────────────────────────────

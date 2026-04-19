@@ -227,6 +227,7 @@ void ToolBar::apply_responsive_layout(int w) {
     if (separators_.size() >= 5) {
         separators_[2]->setVisible(show_credits); // sep before credits
         separators_[3]->setVisible(show_chat);    // sep before chat
+        separators_[4]->setVisible(show_chat && logout_btn_ && logout_btn_->isVisible());
     }
 }
 
@@ -236,11 +237,31 @@ void ToolBar::update_clock() {
 }
 
 void ToolBar::refresh_user_display() {
-    const auto& s = auth::AuthManager::instance().session();
+    auto& auth_mgr = auth::AuthManager::instance();
+    const auto& s = auth_mgr.session();
+    if (auth_mgr.is_local_mode()) {
+        user_label_->setText("LOCAL");
+        user_label_->setToolTip("Local Codex mode");
+        credits_label_->setText("CODEX");
+        credits_label_->setStyleSheet(QString("color:%1;background:transparent;").arg(colors::POSITIVE.get()));
+        plan_btn_->setText("GPT-5.4");
+        plan_btn_->setToolTip("Local Codex mode");
+        plan_btn_->setEnabled(false);
+        logout_btn_->setVisible(false);
+        apply_responsive_layout(width());
+        return;
+    }
+
+    plan_btn_->setEnabled(true);
+    plan_btn_->setToolTip("View Plans & Pricing");
+    logout_btn_->setVisible(s.authenticated);
+
     if (!s.authenticated) {
         user_label_->setText("---");
+        user_label_->setToolTip({});
         credits_label_->setText("---");
         plan_btn_->setText("---");
+        apply_responsive_layout(width());
         return;
     }
 
@@ -259,6 +280,7 @@ void ToolBar::refresh_user_display() {
 
     QString plan_text = s.account_type().toUpper();
     plan_btn_->setText(plan_text.isEmpty() ? "FREE" : plan_text);
+    apply_responsive_layout(width());
 }
 
 QMenu* ToolBar::build_file_menu() {

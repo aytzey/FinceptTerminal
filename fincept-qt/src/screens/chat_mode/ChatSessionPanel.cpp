@@ -1,5 +1,6 @@
 #include "screens/chat_mode/ChatSessionPanel.h"
 
+#include "auth/AuthManager.h"
 #include "core/logging/Logger.h"
 #include "screens/chat_mode/ChatModeService.h"
 #include "ui/theme/Theme.h"
@@ -15,9 +16,21 @@
 
 namespace fincept::chat_mode {
 
+namespace {
+
+bool cloud_sessions_available() {
+    auto& auth = auth::AuthManager::instance();
+    return auth.is_authenticated() && !auth.is_local_mode() && !auth.session().api_key.isEmpty();
+}
+
+} // namespace
+
 ChatSessionPanel::ChatSessionPanel(QWidget* parent) : QWidget(parent) {
     build_ui();
-    refresh_sessions();
+    if (cloud_sessions_available())
+        refresh_sessions();
+    else
+        show_local_mode_placeholder();
 }
 
 void ChatSessionPanel::build_ui() {
@@ -141,6 +154,15 @@ void ChatSessionPanel::build_ui() {
 }
 
 void ChatSessionPanel::refresh_sessions() {
+    if (!cloud_sessions_available()) {
+        show_local_mode_placeholder();
+        return;
+    }
+    search_edit_->setEnabled(true);
+    new_btn_->setEnabled(true);
+    export_btn_->setEnabled(true);
+    delete_btn_->setEnabled(false);
+    rename_btn_->setEnabled(false);
     ChatModeService::instance().list_sessions([this](bool ok, QVector<ChatSession> sessions, QString err) {
         if (!ok) {
             LOG_WARN("ChatSessionPanel", "Failed to load sessions: " + err);
@@ -197,6 +219,21 @@ void ChatSessionPanel::set_active_session(const QString& uuid) {
 
 void ChatSessionPanel::update_stats(const ChatStats& stats) {
     stats_lbl_->setText(QString("%1 sessions | %2 messages").arg(stats.total_sessions).arg(stats.total_messages));
+}
+
+void ChatSessionPanel::show_local_mode_placeholder() {
+    sessions_.clear();
+    active_uuid_.clear();
+    session_list_->clear();
+    auto* item = new QListWidgetItem("Fincept Cloud account required.");
+    item->setFlags(item->flags() & ~Qt::ItemIsEnabled);
+    session_list_->addItem(item);
+    stats_lbl_->setText("Local Codex mode");
+    search_edit_->setEnabled(false);
+    new_btn_->setEnabled(false);
+    delete_btn_->setEnabled(false);
+    rename_btn_->setEnabled(false);
+    export_btn_->setEnabled(false);
 }
 
 // ── Slots ─────────────────────────────────────────────────────────────────────

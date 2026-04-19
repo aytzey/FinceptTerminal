@@ -6,6 +6,7 @@
 
 #include "ai_chat/LlmService.h"
 
+#include "auth/AuthManager.h"
 #include "core/logging/Logger.h"
 #include "mcp/McpService.h"
 #include "storage/repositories/LlmConfigRepository.h"
@@ -559,9 +560,9 @@ void LlmService::ensure_config() const {
     if (provider_.isEmpty()) {
         if (has_codex_oauth_auth()) {
             provider_ = CODEX_PROVIDER;
-            model_ = "gpt-5.3-codex";
+            model_ = "gpt-5.4";
             base_url_ = {};
-            reasoning_effort_ = "medium";
+            reasoning_effort_ = "high";
             LOG_INFO(TAG, "No LLM provider configured — using Codex OAuth default");
         } else {
             provider_ = "fincept";
@@ -571,6 +572,29 @@ void LlmService::ensure_config() const {
         }
     }
 
+    if (provider_ == "fincept" && auth::AuthManager::instance().is_local_mode() && has_codex_oauth_auth()) {
+        provider_ = CODEX_PROVIDER;
+        api_key_.clear();
+        base_url_.clear();
+        if (model_.trimmed().isEmpty() || model_ == "fincept-llm" || model_ == "gpt-5.3-codex")
+            model_ = "gpt-5.4";
+        if (reasoning_effort_.trimmed().isEmpty())
+            reasoning_effort_ = "high";
+
+        LlmConfig codex_cfg;
+        codex_cfg.provider = CODEX_PROVIDER;
+        codex_cfg.base_url = CODEX_DEFAULT_BASE_URL;
+        codex_cfg.model = model_;
+        codex_cfg.reasoning_effort = reasoning_effort_;
+        codex_cfg.is_active = true;
+        codex_cfg.tools_enabled = tools_enabled_;
+        const auto saved = LlmConfigRepository::instance().save_provider(codex_cfg);
+        if (saved.is_ok())
+            LlmConfigRepository::instance().set_active(CODEX_PROVIDER);
+
+        LOG_INFO(TAG, "Fincept provider bypassed in local mode — using Codex OAuth");
+    }
+
     // Fincept always resolves API key from session (never stored in llm_configs)
     if (provider_ == "fincept") {
         auto stored_key = SettingsRepository::instance().get("fincept_api_key");
@@ -578,8 +602,14 @@ void LlmService::ensure_config() const {
             api_key_ = stored_key.value();
     }
 
-    if (reasoning_effort_.trimmed().isEmpty())
+    if (provider_ == CODEX_PROVIDER) {
+        if (model_.trimmed().isEmpty() || model_ == "gpt-5.3-codex")
+            model_ = "gpt-5.4";
+        if (reasoning_effort_.trimmed().isEmpty())
+            reasoning_effort_ = "high";
+    } else if (reasoning_effort_.trimmed().isEmpty()) {
         reasoning_effort_ = "medium";
+    }
 
     auto gs = LlmConfigRepository::instance().get_global_settings();
     if (gs.is_ok()) {
@@ -2615,7 +2645,7 @@ void LlmService::fetch_models(const QString& provider, const QString& api_key, c
             const auto auth = resolve_codex_auth_context(false);
             if (auth.is_err())
                 error = QString::fromStdString(auth.error());
-            const QStringList models = {"gpt-5.3-codex"};
+            const QStringList models = {"gpt-5.4"};
             if (self) {
                 QMetaObject::invokeMethod(
                     self,

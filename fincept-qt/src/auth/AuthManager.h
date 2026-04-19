@@ -17,6 +17,8 @@ class AuthManager : public QObject {
     const SessionData& session() const { return session_; }
     bool is_authenticated() const { return session_.authenticated; }
     bool is_loading() const { return is_loading_; }
+    bool has_local_runtime() const;
+    bool is_local_mode() const;
 
     // Auth flows
     void login(const QString& email, const QString& password, bool force_login = false);

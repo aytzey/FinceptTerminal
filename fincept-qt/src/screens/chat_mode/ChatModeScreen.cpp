@@ -1,5 +1,6 @@
 #include "screens/chat_mode/ChatModeScreen.h"
 
+#include "auth/AuthManager.h"
 #include "core/logging/Logger.h"
 #include "core/session/ScreenStateManager.h"
 #include "screens/chat_mode/ChatAgentPanel.h"
@@ -101,8 +102,17 @@ void ChatModeScreen::wire_signals() {
 
 void ChatModeScreen::showEvent(QShowEvent* e) {
     QWidget::showEvent(e);
+    if (auth::AuthManager::instance().is_local_mode()) {
+        LOG_INFO("ChatModeScreen", "Local Codex mode — skipping Fincept Chat Mode cloud startup");
+        return;
+    }
     LOG_INFO("ChatModeScreen", "Entered chat mode");
     session_panel_->refresh_sessions();
+    agent_panel_->refresh_memory();
+    agent_panel_->refresh_schedules();
+    agent_panel_->refresh_tasks();
+    agent_panel_->refresh_mcp_servers();
+    agent_panel_->refresh_monitors();
 
     // Start tool bridge
     tool_bridge_->start();

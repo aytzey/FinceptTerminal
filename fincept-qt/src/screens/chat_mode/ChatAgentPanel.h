@@ -101,6 +101,7 @@ class ChatAgentPanel : public QWidget {
     QWidget* build_tasks_tab();
     QWidget* build_mcp_tab();
     QWidget* build_monitors_tab();
+    void show_local_mode_placeholders();
 
     static QPushButton* make_btn(const QString& text, const QString& tooltip);
 };

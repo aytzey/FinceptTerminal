@@ -17,7 +17,7 @@ static Result<void> sql(QSqlDatabase& db, const char* stmt) {
 }
 
 Result<void> apply_v019(QSqlDatabase& db) {
-    auto r = sql(db, "ALTER TABLE llm_configs ADD COLUMN reasoning_effort TEXT DEFAULT 'medium'");
+    auto r = sql(db, "ALTER TABLE llm_configs ADD COLUMN reasoning_effort TEXT DEFAULT 'high'");
     if (r.is_err()) {
         QSqlQuery check(db);
         check.exec("SELECT reasoning_effort FROM llm_configs LIMIT 1");
@@ -26,7 +26,7 @@ Result<void> apply_v019(QSqlDatabase& db) {
     }
 
     QSqlQuery backfill(db);
-    backfill.exec("UPDATE llm_configs SET reasoning_effort = 'medium' "
+    backfill.exec("UPDATE llm_configs SET reasoning_effort = 'high' "
                   "WHERE reasoning_effort IS NULL OR trim(reasoning_effort) = ''");
     return Result<void>::ok();
 }

@@ -64,7 +64,7 @@ QStringList LlmConfigSection::fallback_models(const QString& provider) {
     if (p == "openai")
         return {"gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "o3-mini"};
     if (p == "openai-codex")
-        return {"gpt-5.3-codex"};
+        return {"gpt-5.4"};
     if (p == "anthropic")
         return {"claude-sonnet-4-5-20250514", "claude-opus-4-5", "claude-3-5-sonnet-20241022",
                 "claude-3-haiku-20240307"};
@@ -397,7 +397,7 @@ QWidget* LlmConfigSection::build_form_panel() {
                                            QString(ui::colors::BG_RAISED()) + ";selection-color:" +
                                            QString(ui::colors::AMBER()) + ";border:1px solid " +
                                            QString(ui::colors::BORDER_MED()) + ";}");
-    reasoning_effort_combo_->setCurrentText("medium");
+    reasoning_effort_combo_->setCurrentText("high");
     form->addRow(e_lbl, reasoning_effort_combo_);
 
     auto* b_lbl = new QLabel("Base URL");
@@ -627,20 +627,25 @@ void LlmConfigSection::populate_form(const QString& provider) {
     for (const auto& p : result.value()) {
         if (p.provider.toLower() == provider.toLower()) {
             // Set model — try to select in combo, or set as editable text
-            if (!p.model.isEmpty()) {
-                int idx = model_combo_->findText(p.model);
+            QString resolved_model = p.model;
+            if (is_codex && (resolved_model.isEmpty() || resolved_model == "gpt-5.3-codex"))
+                resolved_model = "gpt-5.4";
+            if (!resolved_model.isEmpty()) {
+                int idx = model_combo_->findText(resolved_model);
                 if (idx >= 0)
                     model_combo_->setCurrentIndex(idx);
                 else
-                    model_combo_->setCurrentText(p.model);
+                    model_combo_->setCurrentText(resolved_model);
             }
             base_url_edit_->setText(p.base_url.isEmpty() ? def_url : p.base_url);
 
             // Tools toggle — always visible
             tools_check_->setChecked(p.tools_enabled);
             tools_check_->setVisible(true);
-            reasoning_effort_combo_->setCurrentText(
-                p.reasoning_effort.isEmpty() ? QStringLiteral("medium") : p.reasoning_effort.toLower());
+            const QString effort =
+                p.reasoning_effort.isEmpty() ? (is_codex ? QStringLiteral("high") : QStringLiteral("medium"))
+                                             : p.reasoning_effort.toLower();
+            reasoning_effort_combo_->setCurrentText(effort);
             reasoning_effort_combo_->setEnabled(is_codex);
 
             if (is_fincept) {
@@ -703,7 +708,7 @@ void LlmConfigSection::populate_form(const QString& provider) {
         model_combo_->setVisible(true);
         model_combo_->setEnabled(true);
         reasoning_effort_combo_->setEnabled(true);
-        reasoning_effort_combo_->setCurrentText("medium");
+        reasoning_effort_combo_->setCurrentText("high");
         fetch_btn_->setVisible(true);
         fetch_btn_->setEnabled(true);
         base_url_edit_->setVisible(true);
@@ -764,9 +769,9 @@ void LlmConfigSection::on_save_provider() {
 
     if (is_codex) {
         if (cfg.model.isEmpty())
-            cfg.model = "gpt-5.3-codex";
+            cfg.model = "gpt-5.4";
         if (cfg.reasoning_effort.isEmpty())
-            cfg.reasoning_effort = "medium";
+            cfg.reasoning_effort = "high";
     }
 
     // Basic validation

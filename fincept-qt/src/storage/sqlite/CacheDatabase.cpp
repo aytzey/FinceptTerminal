@@ -2,6 +2,8 @@
 
 #include "core/logging/Logger.h"
 
+#include <QDir>
+#include <QFileInfo>
 #include <QMutexLocker>
 
 namespace fincept {
@@ -12,6 +14,12 @@ CacheDatabase& CacheDatabase::instance() {
 }
 
 Result<void> CacheDatabase::open(const QString& path) {
+    const QFileInfo db_file(path);
+    if (!db_file.absolutePath().isEmpty() && !QDir().mkpath(db_file.absolutePath())) {
+        return Result<void>::err(QString("Failed to create cache database directory: %1").arg(db_file.absolutePath())
+                                     .toStdString());
+    }
+
     db_ = QSqlDatabase::addDatabase("QSQLITE", "fincept_cache");
     db_.setDatabaseName(path);
     if (!db_.open()) {
