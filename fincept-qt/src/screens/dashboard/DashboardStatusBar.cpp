@@ -1,5 +1,6 @@
 #include "screens/dashboard/DashboardStatusBar.h"
 
+#include "auth/AuthManager.h"
 #include "ui/theme/Theme.h"
 #include "ui/theme/ThemeManager.h"
 #include "ui/widgets/NotifBell.h"
@@ -178,6 +179,13 @@ void DashboardStatusBar::set_connected(bool connected) {
 }
 
 void DashboardStatusBar::ping_api() {
+    if (auth::AuthManager::instance().has_local_runtime()) {
+        latency_label_->setText("LAT: LOCAL");
+        latency_label_->setStyleSheet(
+            QString("color:%1;font-weight:bold;background:transparent;").arg(ui::colors::POSITIVE()));
+        return;
+    }
+
     QNetworkRequest req(QUrl("https://api.fincept.in/health"));
     req.setTransferTimeout(5000);
     ping_elapsed_.restart();

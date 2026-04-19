@@ -16,6 +16,7 @@ from pathlib import Path
 
 GLINER_MODEL_NAME = "urchade/gliner_medium-v2.1"
 EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+FINBERT_MODEL_NAME = "ProsusAI/finbert"
 ENTITY_LABELS = ["person", "organization", "company", "country", "city", "region", "location"]
 GEO_ENTITY_LABELS = ["country", "city", "region", "location"]
 EVENT_LABEL_TEXTS = {
@@ -101,6 +102,16 @@ def get_embed_model():
     from sentence_transformers import SentenceTransformer
 
     return SentenceTransformer(EMBED_MODEL_NAME, device="cpu")
+
+
+@lru_cache(maxsize=1)
+def get_finbert_model():
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(FINBERT_MODEL_NAME)
+    model = AutoModelForSequenceClassification.from_pretrained(FINBERT_MODEL_NAME)
+    model.eval()
+    return tokenizer, model
 
 
 @lru_cache(maxsize=1)
@@ -475,64 +486,72 @@ def extract_geopolitics_events(headlines_json, country_filter="", city_filter=""
 
 
 def analyze_sentiment_batch(headlines_json):
-    """Batch sentiment analysis with confidence scores."""
+    """Batch financial sentiment analysis with FinBERT on CPU."""
     try:
         articles = json.loads(headlines_json) if isinstance(headlines_json, str) else headlines_json
     except json.JSONDecodeError:
         return {"success": False, "error": "Invalid JSON"}
 
-    positives = {
-        "surge": 3, "soar": 3, "skyrocket": 3, "breakthrough": 3, "boom": 3,
-        "record high": 3, "rally": 2, "gain": 2, "rise": 2, "jump": 2,
-        "climb": 2, "rebound": 2, "boost": 2, "beat": 2, "exceed": 2,
-        "upgrade": 2, "profit": 2, "growth": 2, "recover": 2, "victory": 2,
-        "ceasefire": 2, "strong": 1, "robust": 1, "bullish": 1, "optimism": 1,
-        "milestone": 1, "positive": 1, "success": 1, "approval": 1, "deal": 1,
-    }
-    negatives = {
-        "crash": 3, "plunge": 3, "collapse": 3, "devastat": 3, "catastroph": 3,
-        "invasion": 3, "war crime": 3, "bankruptcy": 3, "meltdown": 3,
-        "fall": 2, "drop": 2, "decline": 2, "tumble": 2, "slump": 2, "miss": 2,
-        "fail": 2, "recession": 2, "crisis": 2, "conflict": 2, "attack": 2,
-        "sanction": 2, "tariff": 2, "escalat": 2, "layoff": 2, "downgrade": 2,
-        "fraud": 2, "scandal": 2, "disaster": 2, "weak": 1, "loss": 1,
-        "deficit": 1, "fear": 1, "threat": 1, "warning": 1, "bearish": 1,
-        "volatile": 1, "uncertain": 1, "ban": 1, "suspend": 1,
-    }
+    if not articles:
+        return {
+            "success": True,
+            "results": [],
+            "aggregate": {"bullish": 0, "bearish": 0, "neutral": 0},
+            "overall_score": 0.0,
+            "method": {"sentiment": FINBERT_MODEL_NAME, "device": "cpu"},
+        }
+
+    try:
+        import torch
+
+        tokenizer, model = get_finbert_model()
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": f"FinBERT model unavailable: {type(exc).__name__}: {exc}",
+            "method": {"sentiment": FINBERT_MODEL_NAME, "device": "cpu"},
+        }
+
+    label_map = {int(idx): label.lower() for idx, label in model.config.id2label.items()}
+    texts = [
+        (article.get("headline", "") + ". " + article.get("summary", "")).strip() or article.get("id", "")
+        for article in articles
+    ]
 
     results = []
-    for article in articles:
-        text = (article.get("headline", "") + " " + article.get("summary", "")).lower()
-        pos_score = sum(w for p, w in positives.items() if p in text)
-        neg_score = sum(w for p, w in negatives.items() if p in text)
-        total = pos_score + neg_score
-        net = pos_score - neg_score
+    with torch.no_grad():
+        for start in range(0, len(texts), 16):
+            batch_texts = texts[start:start + 16]
+            encoded = tokenizer(batch_texts, padding=True, truncation=True, max_length=256, return_tensors="pt")
+            probs = torch.softmax(model(**encoded).logits, dim=-1)
+            for offset, row in enumerate(probs):
+                article = articles[start + offset]
+                probability_by_label = {
+                    label_map.get(idx, str(idx)): float(row[idx].item()) for idx in range(row.shape[0])
+                }
+                positive = probability_by_label.get("positive", 0.0)
+                negative = probability_by_label.get("negative", 0.0)
+                neutral = probability_by_label.get("neutral", 0.0)
+                ranked_label = max(probability_by_label, key=probability_by_label.get)
 
-        if total == 0:
-            sentiment = "NEUTRAL"
-            score = 0.0
-            confidence = 0.2
-        elif net >= 2:
-            sentiment = "BULLISH"
-            score = min(net / max(total, 1), 1.0)
-            confidence = min(0.4 + total * 0.05, 0.95)
-        elif net <= -2:
-            sentiment = "BEARISH"
-            score = max(net / max(total, 1), -1.0)
-            confidence = min(0.4 + total * 0.05, 0.95)
-        else:
-            sentiment = "NEUTRAL"
-            score = net / max(total, 1)
-            confidence = 0.3
+                if ranked_label == "positive":
+                    sentiment = "BULLISH"
+                elif ranked_label == "negative":
+                    sentiment = "BEARISH"
+                else:
+                    sentiment = "NEUTRAL"
 
-        results.append({
-            "id": article.get("id", ""),
-            "sentiment": sentiment,
-            "score": round(score, 3),
-            "confidence": round(confidence, 3),
-            "positive_signals": pos_score,
-            "negative_signals": neg_score,
-        })
+                results.append({
+                    "id": article.get("id", ""),
+                    "sentiment": sentiment,
+                    "score": round(positive - negative, 4),
+                    "confidence": round(max(positive, negative, neutral), 4),
+                    "probabilities": {
+                        "positive": round(positive, 4),
+                        "negative": round(negative, 4),
+                        "neutral": round(neutral, 4),
+                    },
+                })
 
     # Aggregate
     bull = sum(1 for r in results if r["sentiment"] == "BULLISH")
@@ -544,6 +563,7 @@ def analyze_sentiment_batch(headlines_json):
         "results": results,
         "aggregate": {"bullish": bull, "bearish": bear, "neutral": neut},
         "overall_score": round(sum(r["score"] for r in results) / max(len(results), 1), 3),
+        "method": {"sentiment": FINBERT_MODEL_NAME, "device": "cpu"},
     }
 
 

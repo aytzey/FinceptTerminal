@@ -118,9 +118,9 @@ QJsonObject AgentService::build_api_keys() const {
         }
     }
 
-    // Always include the active Fincept API key so agents can reach Fincept
-    // services even in local Codex mode with a standalone key.
-    if (!keys.contains("fincept")) {
+    // In local runtime mode, do not pass Fincept credentials into Python agents.
+    // Local/Codex workflows should not silently fall back to paid Fincept APIs.
+    if (!keys.contains("fincept") && !auth::AuthManager::instance().has_local_runtime()) {
         const QString fincept_api_key = auth::AuthManager::instance().effective_api_key();
         if (!fincept_api_key.isEmpty()) {
             keys["fincept"] = fincept_api_key;
@@ -138,6 +138,8 @@ QJsonObject AgentService::build_payload(const QString& action, const QJsonObject
     QJsonObject payload;
     payload["action"] = action;
     payload["api_keys"] = build_api_keys();
+    payload["local_runtime"] = auth::AuthManager::instance().has_local_runtime();
+    payload["fincept_cloud_fallback"] = !auth::AuthManager::instance().has_local_runtime();
 
     // Inject the resolved LLM config as active_llm so Python can build the exact
     // model instance without re-resolving credentials.

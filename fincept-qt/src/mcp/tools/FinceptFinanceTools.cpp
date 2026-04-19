@@ -22,7 +22,7 @@
 namespace fincept::mcp::tools {
 namespace {
 
-static constexpr int kAsyncTimeoutMs = 20000;
+static constexpr int kAsyncTimeoutMs = 90000;
 
 ToolResult run_script_sync(const QString& script, const QStringList& args) {
     if (!python::PythonRunner::instance().is_available())
@@ -132,6 +132,13 @@ QJsonObject analysis_to_json(const services::NewsAnalysis& analysis) {
         {"credits_used", analysis.credits_used},
         {"credits_remaining", analysis.credits_remaining},
     };
+}
+
+QJsonObject model_result_object(const ToolResult& result) {
+    const QJsonObject obj = result.data.toObject();
+    if (obj.contains("data") && obj.value("data").isObject())
+        return obj.value("data").toObject();
+    return obj;
 }
 
 ToolResult run_news_analysis_sync(const QString& url) {
@@ -523,37 +530,52 @@ std::vector<ToolDef> get_fincept_finance_tools() {
 
             QJsonArray matches;
             QMap<QString, int> category_counts;
-            QMap<QString, int> ticker_counts;
-            QMap<QString, int> tone_counts;
             for (int i = 0; i < std::min(limit, static_cast<int>(scored.size())); ++i) {
                 const auto article = scored[i].second;
                 matches.append(article);
                 category_counts[article.value("category").toString()] += 1;
-                tone_counts[article.value("sentiment").toString()] += 1;
-                for (const auto& ticker_value : article.value("tickers").toArray())
-                    ticker_counts[ticker_value.toString()] += 1;
             }
+
+            const QString model_payload =
+                QString::fromUtf8(QJsonDocument(matches).toJson(QJsonDocument::Compact));
+            ToolResult model_sentiment =
+                run_script_sync("news_nlp.py", {"analyze_sentiment_batch", model_payload});
+            if (!model_sentiment.success)
+                return ToolResult::fail("Model sentiment failed: " + model_sentiment.error);
+
+            ToolResult entities = run_script_sync("news_nlp.py", {"extract_entities", model_payload});
+            if (!entities.success)
+                return ToolResult::fail("Model entity extraction failed: " + entities.error);
+
+            ToolResult clusters = run_script_sync("news_nlp.py", {"cluster_semantic", model_payload});
+            if (!clusters.success)
+                return ToolResult::fail("Semantic clustering failed: " + clusters.error);
+
+            const QJsonObject sentiment_obj = model_result_object(model_sentiment);
+            const QJsonObject entities_obj = model_result_object(entities);
+            const QJsonObject clusters_obj = model_result_object(clusters);
 
             QJsonArray categories;
             for (auto it = category_counts.begin(); it != category_counts.end(); ++it)
                 categories.append(QJsonObject{{"category", it.key()}, {"count", it.value()}});
 
-            QList<QPair<QString, int>> ranked_tickers;
-            for (auto it = ticker_counts.begin(); it != ticker_counts.end(); ++it)
-                ranked_tickers.append({it.key(), it.value()});
-            std::sort(ranked_tickers.begin(), ranked_tickers.end(),
-                      [](const auto& a, const auto& b) { return a.second > b.second; });
             QJsonArray top_tickers;
-            for (int i = 0; i < std::min(5, static_cast<int>(ranked_tickers.size())); ++i)
-                top_tickers.append(QJsonObject{{"symbol", ranked_tickers[i].first}, {"count", ranked_tickers[i].second}});
+            const QJsonArray entity_tickers = entities_obj.value("top_tickers").toArray();
+            for (int i = 0; i < std::min(5, static_cast<int>(entity_tickers.size())); ++i)
+                top_tickers.append(entity_tickers.at(i).toObject());
+
+            const QJsonObject aggregate = sentiment_obj.value("aggregate").toObject();
+            const int bullish = aggregate.value("bullish").toInt();
+            const int bearish = aggregate.value("bearish").toInt();
+            const int neutral = aggregate.value("neutral").toInt();
 
             const QString summary =
-                QString("%1 local headline matched '%2'. Tone: %3 bullish, %4 bearish, %5 neutral.")
+                QString("%1 local headline matched '%2'. FinBERT tone: %3 bullish, %4 bearish, %5 neutral.")
                     .arg(matches.size())
                     .arg(topic)
-                    .arg(tone_counts.value("BULLISH"))
-                    .arg(tone_counts.value("BEARISH"))
-                    .arg(tone_counts.value("NEUTRAL"));
+                    .arg(bullish)
+                    .arg(bearish)
+                    .arg(neutral);
 
             return ToolResult::ok(summary,
                                   QJsonObject{{"topic", topic},
@@ -561,10 +583,16 @@ std::vector<ToolDef> get_fincept_finance_tools() {
                                               {"matches", matches},
                                               {"categories", categories},
                                               {"top_tickers", top_tickers},
-                                              {"tone", QJsonObject{{"bullish", tone_counts.value("BULLISH")},
-                                                                   {"bearish", tone_counts.value("BEARISH")},
-                                                                   {"neutral", tone_counts.value("NEUTRAL")}}},
-                                              {"source", "local_news_pipeline"}});
+                                              {"tone", QJsonObject{{"bullish", bullish},
+                                                                   {"bearish", bearish},
+                                                                   {"neutral", neutral},
+                                                                   {"overall_score",
+                                                                    sentiment_obj.value("overall_score").toDouble()}}},
+                                              {"model_sentiment", sentiment_obj},
+                                              {"entities", entities_obj},
+                                              {"semantic_clusters", clusters_obj},
+                                              {"source", "local_news_pipeline"},
+                                              {"model_source", "FinBERT + GLiNER + sentence-transformers"}});
         };
         tools.push_back(std::move(t));
     }
