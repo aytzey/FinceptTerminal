@@ -1,6 +1,7 @@
 // src/services/maritime/MaritimeService.cpp
 #include "services/maritime/MaritimeService.h"
 
+#include "auth/AuthManager.h"
 #include "core/logging/Logger.h"
 #include "network/http/HttpClient.h"
 #include "storage/cache/CacheManager.h"
@@ -18,6 +19,16 @@ namespace fincept::services::maritime {
 namespace {
 inline void publish_to_hub(const QString& topic, const QVariant& value) {
     fincept::datahub::DataHub::instance().publish(topic, value);
+}
+
+bool local_maritime_enabled() {
+    const auto& auth = auth::AuthManager::instance();
+    return auth.has_local_runtime() || !auth.has_fincept_api_key();
+}
+
+QString local_unavailable_message() {
+    return QStringLiteral("Local maritime AIS provider is not configured. Fincept Cloud fallback is disabled; "
+                          "use cached vessel data or configure an open AIS provider.");
 }
 }  // namespace
 
@@ -64,6 +75,11 @@ static QJsonObject unwrap(const QJsonObject& root) {
 // ── Area search (uses multi-vessel with well-known port IMOs) ────────────────
 void MaritimeService::search_vessels_by_area(const AreaSearchParams& params) {
     Q_UNUSED(params);
+    if (local_maritime_enabled()) {
+        emit error_occurred("area_search", local_unavailable_message());
+        return;
+    }
+
     // The API doesn't have an area-search endpoint.
     // Use multi-vessel with a set of well-known container ship IMOs instead.
     static const QStringList known_imos = {
@@ -91,6 +107,11 @@ void MaritimeService::get_vessel_position(const QString& imo) {
     if (!cached.isNull()) {
         auto vessel = parse_vessel(QJsonDocument::fromJson(cached.toString().toUtf8()).object());
         emit vessel_found(vessel);
+        return;
+    }
+
+    if (local_maritime_enabled()) {
+        emit error_occurred("vessel_position", local_unavailable_message());
         return;
     }
 
@@ -135,6 +156,23 @@ void MaritimeService::get_multi_vessel_positions(const QStringList& imos) {
         for (const auto& v : vessels_arr)
             vessels.append(parse_vessel(v.toObject()));
         emit vessels_loaded(vessels, vessels.size());
+        return;
+    }
+
+    if (local_maritime_enabled()) {
+        QVector<VesselData> vessels;
+        for (const auto& imo : imos) {
+            const QVariant single_cached = fincept::CacheManager::instance().get("maritime:vessel:" + imo.trimmed());
+            if (!single_cached.isNull())
+                vessels.append(parse_vessel(QJsonDocument::fromJson(single_cached.toString().toUtf8()).object()));
+        }
+        if (!vessels.isEmpty()) {
+            emit vessels_loaded(vessels, vessels.size());
+            if (hub_registered_)
+                publish_to_hub(QStringLiteral("maritime:vessels:multi"), QVariant::fromValue(vessels));
+            return;
+        }
+        emit error_occurred("multi_vessel", local_unavailable_message());
         return;
     }
 
@@ -185,6 +223,11 @@ void MaritimeService::get_vessel_history(const QString& imo) {
         return;
     }
 
+    if (local_maritime_enabled()) {
+        emit error_occurred("vessel_history", local_unavailable_message());
+        return;
+    }
+
     QJsonObject body;
     body["imo"] = imo.trimmed();
 
@@ -219,6 +262,17 @@ void MaritimeService::get_vessel_history(const QString& imo) {
 
 // ── Health check ─────────────────────────────────────────────────────────────
 void MaritimeService::check_health() {
+    if (local_maritime_enabled()) {
+        QJsonObject obj{{"status", "local"},
+                        {"provider", "cache_or_open_ais"},
+                        {"fincept_cloud_fallback", false},
+                        {"message", local_unavailable_message()}};
+        emit health_loaded(obj);
+        if (hub_registered_)
+            publish_to_hub(QStringLiteral("maritime:health"), QVariant(obj));
+        return;
+    }
+
     QPointer<MaritimeService> self = this;
     HttpClient::instance().get(QString(kMarineBase) + "/health", [self](Result<QJsonDocument> result) {
         if (!self)
@@ -259,7 +313,7 @@ void MaritimeService::refresh(const QStringList& topics) {
 }
 
 int MaritimeService::max_requests_per_sec() const {
-    return 2;  // Fincept marine API — conservative
+    return 2;  // External AIS provider cap — conservative.
 }
 
 void MaritimeService::ensure_registered_with_hub() {

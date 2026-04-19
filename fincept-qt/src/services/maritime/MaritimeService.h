@@ -8,7 +8,8 @@
 
 namespace fincept::services::maritime {
 
-/// Singleton service for Maritime Intelligence — HTTP calls to api.fincept.in/marine/
+/// Singleton service for Maritime Intelligence.
+/// Local runtime never falls back to Fincept Cloud; it uses cache/open AIS providers only.
 class MaritimeService : public QObject
     , public fincept::datahub::Producer
 {
