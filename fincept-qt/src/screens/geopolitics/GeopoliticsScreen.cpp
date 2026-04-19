@@ -338,7 +338,7 @@ QWidget* GeopoliticsScreen::build_status_bar() {
 
     auto* lbl1 = new QLabel("SOURCE:", bar);
     lbl1->setStyleSheet(s);
-    auto* val1 = new QLabel("NEWS-EVENTS API + HDX", bar);
+    auto* val1 = new QLabel("RSS + LIVE SEARCH + HDX", bar);
     val1->setStyleSheet(sv);
     hl->addWidget(lbl1);
     hl->addWidget(val1);

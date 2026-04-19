@@ -1,6 +1,7 @@
 #include "services/news/NewsService.h"
 
 #include "core/logging/Logger.h"
+#include "python/PythonRunner.h"
 #include "storage/cache/CacheManager.h"
 
 #    include "datahub/DataHub.h"
@@ -40,6 +41,7 @@ struct ArticleSnapshot {
     QString title;
     QString summary;
     QString body;
+    QString source;
     QString error;
 };
 
@@ -555,73 +557,118 @@ void NewsService::fetch_all_news_progressive(bool force, ArticlesCallback final_
 // ── Local Article Analysis ──────────────────────────────────────────────────
 
 void NewsService::analyze_article(const QString& url, AnalysisCallback cb) {
-    const auto snapshot = fetch_article_snapshot(nam_, url.trimmed());
-    if (!snapshot.success) {
-        LOG_ERROR("NewsService", "Local article analysis failed: " + snapshot.error);
-        cb(false, {});
+    const QString trimmed_url = url.trimmed();
+    auto build_local_analysis = [this, trimmed_url](const ArticleSnapshot& snapshot) {
+        NewsArticle article;
+        article.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        article.link = trimmed_url;
+        article.headline = snapshot.title.left(200);
+        article.summary = snapshot.summary.left(kSummaryMaxChars);
+        article.source = snapshot.source.isEmpty() ? QUrl(trimmed_url).host().toUpper() : snapshot.source.left(80);
+        article.category = "MARKETS";
+        article.region = "GLOBAL";
+        article.time = QDateTime::currentDateTime().toString("MMM dd, HH:mm");
+        article.sort_ts = QDateTime::currentSecsSinceEpoch();
+        enrich_article(article);
+
+        const QString combined_text = (snapshot.title + " " + snapshot.summary + " " + snapshot.body).toLower();
+
+        NewsAnalysis analysis;
+        analysis.sentiment.score =
+            article.sentiment == Sentiment::BULLISH ? 0.6 : article.sentiment == Sentiment::BEARISH ? -0.6 : 0.0;
+        analysis.sentiment.intensity =
+            article.impact == Impact::HIGH ? 0.9 : article.impact == Impact::MEDIUM ? 0.6 : 0.3;
+        analysis.sentiment.confidence = std::max(0.45, article.threat.confidence);
+        analysis.market_impact.urgency = impact_string(article.impact);
+        analysis.market_impact.prediction = impact_prediction(article);
+        analysis.summary = snapshot.summary.isEmpty() ? snapshot.body.left(kSummaryMaxChars) : snapshot.summary;
+        analysis.keywords = top_terms(snapshot.title + " " + snapshot.summary + " " + snapshot.body, 8);
+        analysis.topics = derive_topics(article, combined_text);
+        analysis.key_points << snapshot.title;
+        if (!analysis.summary.isEmpty())
+            analysis.key_points << analysis.summary.left(180);
+        if (!article.tickers.isEmpty())
+            analysis.key_points << (QStringLiteral("Potentially affected tickers: ") + article.tickers.join(", "));
+        else
+            analysis.key_points << QString("Detected category: %1").arg(article.category);
+
+        analysis.regulatory = classify_signal(
+            combined_text,
+            {"sec", "antitrust", "sanction", "embargo", "lawsuit", "regulator", "investigation"},
+            {"policy", "tariff", "compliance", "probe"},
+            "Regulatory or legal friction appears prominent in the article",
+            "Regulatory follow-through may matter if the story develops");
+        analysis.geopolitical = classify_signal(
+            combined_text,
+            {"war", "missile", "military", "airstrike", "border", "sanction", "ceasefire"},
+            {"election", "diplomatic", "protest", "tension", "summit"},
+            "Geopolitical escalation markers were detected in the article",
+            "Geopolitical context is present but not dominant");
+        analysis.operational = classify_signal(
+            combined_text,
+            {"outage", "strike", "shutdown", "recall", "cyberattack", "disruption", "shortage"},
+            {"delay", "maintenance", "supply chain", "logistics"},
+            "Operational disruption risk is elevated",
+            "Operational execution may need monitoring");
+        analysis.market = classify_signal(
+            combined_text,
+            {"recession", "bankruptcy", "earnings miss", "flash crash", "trading halt", "downgrade"},
+            {"inflation", "rate", "volatility", "selloff", "guidance"},
+            "Market-sensitive downside catalysts were detected",
+            "Macro or market sensitivity is visible in the story");
+        analysis.credits_used = 0;
+        analysis.credits_remaining = 0;
+        return analysis;
+    };
+
+    auto finish_with_snapshot = [this, cb, build_local_analysis](const ArticleSnapshot& snapshot) {
+        if (!snapshot.success) {
+            LOG_ERROR("NewsService", "Local article analysis failed: " + snapshot.error);
+            cb(false, {});
+            return;
+        }
+
+        const NewsAnalysis analysis = build_local_analysis(snapshot);
+        cb(true, analysis);
+        emit this->analysis_ready(analysis);
+    };
+
+    if (!python::PythonRunner::instance().is_available()) {
+        finish_with_snapshot(fetch_article_snapshot(nam_, trimmed_url));
         return;
     }
 
-    NewsArticle article;
-    article.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
-    article.link = url.trimmed();
-    article.headline = snapshot.title.left(200);
-    article.summary = snapshot.summary.left(kSummaryMaxChars);
-    article.source = QUrl(url).host().toUpper();
-    article.category = "MARKETS";
-    article.region = "GLOBAL";
-    article.time = QDateTime::currentDateTime().toString("MMM dd, HH:mm");
-    article.sort_ts = QDateTime::currentSecsSinceEpoch();
-    enrich_article(article);
+    QPointer<NewsService> self = this;
+    python::PythonRunner::instance().run(
+        "news_article_extract.py", {trimmed_url}, [self, finish_with_snapshot, trimmed_url](python::PythonResult result) {
+            if (!self)
+                return;
 
-    const QString combined_text = (snapshot.title + " " + snapshot.summary + " " + snapshot.body).toLower();
+            if (result.success) {
+                const QJsonObject obj = QJsonDocument::fromJson(result.output.toUtf8()).object();
+                if (obj["success"].toBool()) {
+                    ArticleSnapshot snapshot;
+                    snapshot.success = true;
+                    snapshot.title = obj["title"].toString().trimmed();
+                    snapshot.summary = obj["summary"].toString().trimmed();
+                    snapshot.body = obj["body"].toString().trimmed();
+                    snapshot.source = obj["source"].toString().trimmed().toUpper();
+                    if (snapshot.summary.isEmpty())
+                        snapshot.summary = snapshot.body.left(kSummaryMaxChars);
+                    if (snapshot.title.isEmpty())
+                        snapshot.title = snapshot.summary.left(120);
+                    if (!snapshot.title.isEmpty() || !snapshot.summary.isEmpty() || !snapshot.body.isEmpty()) {
+                        finish_with_snapshot(snapshot);
+                        return;
+                    }
+                }
+                LOG_WARN("NewsService", "Python extractor returned empty article content, falling back to Qt fetch");
+            } else {
+                LOG_WARN("NewsService", "Python extractor failed, falling back to Qt fetch: " + result.error.left(160));
+            }
 
-    NewsAnalysis analysis;
-    analysis.sentiment.score = article.sentiment == Sentiment::BULLISH ? 0.6 : article.sentiment == Sentiment::BEARISH ? -0.6 : 0.0;
-    analysis.sentiment.intensity = article.impact == Impact::HIGH ? 0.9 : article.impact == Impact::MEDIUM ? 0.6 : 0.3;
-    analysis.sentiment.confidence = std::max(0.45, article.threat.confidence);
-    analysis.market_impact.urgency = impact_string(article.impact);
-    analysis.market_impact.prediction = impact_prediction(article);
-    analysis.summary = snapshot.summary.isEmpty() ? snapshot.body.left(kSummaryMaxChars) : snapshot.summary;
-    analysis.keywords = top_terms(snapshot.title + " " + snapshot.summary + " " + snapshot.body, 8);
-    analysis.topics = derive_topics(article, combined_text);
-    analysis.key_points << snapshot.title;
-    if (!analysis.summary.isEmpty())
-        analysis.key_points << analysis.summary.left(180);
-    if (!article.tickers.isEmpty())
-        analysis.key_points << (QStringLiteral("Potentially affected tickers: ") + article.tickers.join(", "));
-    else
-        analysis.key_points << QString("Detected category: %1").arg(article.category);
-
-    analysis.regulatory = classify_signal(
-        combined_text,
-        {"sec", "antitrust", "sanction", "embargo", "lawsuit", "regulator", "investigation"},
-        {"policy", "tariff", "compliance", "probe"},
-        "Regulatory or legal friction appears prominent in the article",
-        "Regulatory follow-through may matter if the story develops");
-    analysis.geopolitical = classify_signal(
-        combined_text,
-        {"war", "missile", "military", "airstrike", "border", "sanction", "ceasefire"},
-        {"election", "diplomatic", "protest", "tension", "summit"},
-        "Geopolitical escalation markers were detected in the article",
-        "Geopolitical context is present but not dominant");
-    analysis.operational = classify_signal(
-        combined_text,
-        {"outage", "strike", "shutdown", "recall", "cyberattack", "disruption", "shortage"},
-        {"delay", "maintenance", "supply chain", "logistics"},
-        "Operational disruption risk is elevated",
-        "Operational execution may need monitoring");
-    analysis.market = classify_signal(
-        combined_text,
-        {"recession", "bankruptcy", "earnings miss", "flash crash", "trading halt", "downgrade"},
-        {"inflation", "rate", "volatility", "selloff", "guidance"},
-        "Market-sensitive downside catalysts were detected",
-        "Macro or market sensitivity is visible in the story");
-    analysis.credits_used = 0;
-    analysis.credits_remaining = 0;
-
-    cb(true, analysis);
-    emit this->analysis_ready(analysis);
+            finish_with_snapshot(fetch_article_snapshot(self->nam_, trimmed_url));
+        });
 }
 
 // ── Local Headline Summarization ─────────────────────────────────────────────

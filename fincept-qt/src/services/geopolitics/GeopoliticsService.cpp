@@ -11,6 +11,7 @@
 
 #include <QJsonArray>
 #include <QJsonDocument>
+#include <QJsonObject>
 #include <QMap>
 #include <QPointer>
 #include <QSet>
@@ -79,6 +80,7 @@ QString classify_event_category(const fincept::services::NewsArticle& article, c
 }
 
 QString keyword_summary(const fincept::services::NewsArticle& article) {
+    const QString headline = article.headline.simplified().left(140);
     QStringList keywords = article.tickers;
     const QString text = (article.headline + " " + article.summary).toLower();
     if (text.contains("war"))
@@ -92,7 +94,119 @@ QString keyword_summary(const fincept::services::NewsArticle& article) {
     if (text.contains("election"))
         keywords << "election";
     keywords.removeDuplicates();
-    return keywords.mid(0, 6).join(", ");
+    const QString keyword_text = keywords.mid(0, 4).join(", ");
+    if (!headline.isEmpty() && !keyword_text.isEmpty())
+        return headline + " | " + keyword_text;
+    if (!headline.isEmpty())
+        return headline;
+    return keyword_text.isEmpty() ? article.summary.simplified().left(140) : keyword_text;
+}
+
+QString event_cache_key(const QString& country, const QString& city, const QString& category, int limit) {
+    return QString("geo:events:%1:%2:%3:%4").arg(country, city, category).arg(limit);
+}
+
+QByteArray cached_bytes(const QVariant& cached) {
+    QByteArray raw = cached.toByteArray();
+    if (raw.isEmpty())
+        raw = cached.toString().toUtf8();
+    return raw;
+}
+
+QVector<NewsEvent> events_from_json(const QJsonArray& arr) {
+    QVector<NewsEvent> events;
+    events.reserve(arr.size());
+    for (const auto& value : arr) {
+        const QJsonObject o = value.toObject();
+        NewsEvent ev;
+        ev.url = o["url"].toString();
+        ev.domain = o["domain"].toString();
+        ev.event_category = o["event_category"].toString();
+        ev.matched_keywords = o["matched_keywords"].toString();
+        ev.city = o["city"].toString();
+        ev.country = o["country"].toString();
+        ev.latitude = o["latitude"].toDouble(std::numeric_limits<double>::quiet_NaN());
+        ev.longitude = o["longitude"].toDouble(std::numeric_limits<double>::quiet_NaN());
+        ev.extracted_date = o["extracted_date"].toString();
+        ev.created_at = o["created_at"].toString();
+        events.append(ev);
+    }
+    return events;
+}
+
+QJsonArray events_to_json(const QVector<NewsEvent>& events) {
+    QJsonArray cached_arr;
+    for (const auto& ev : events) {
+        QJsonObject o;
+        o["url"] = ev.url;
+        o["domain"] = ev.domain;
+        o["event_category"] = ev.event_category;
+        o["matched_keywords"] = ev.matched_keywords;
+        o["city"] = ev.city;
+        o["country"] = ev.country;
+        o["latitude"] = ev.latitude;
+        o["longitude"] = ev.longitude;
+        o["extracted_date"] = ev.extracted_date;
+        o["created_at"] = ev.created_at;
+        cached_arr.append(o);
+    }
+    return cached_arr;
+}
+
+QVector<fincept::services::NewsArticle> parse_live_search_articles(const QString& payload) {
+    QVector<fincept::services::NewsArticle> articles;
+    const QJsonObject obj = QJsonDocument::fromJson(payload.toUtf8()).object();
+    if (!obj["success"].toBool())
+        return articles;
+
+    const QJsonArray arr = obj["articles"].toArray();
+    articles.reserve(arr.size());
+    for (const auto& value : arr) {
+        const QJsonObject item = value.toObject();
+        fincept::services::NewsArticle article;
+        article.id = item["id"].toString();
+        article.headline = item["headline"].toString();
+        article.summary = item["summary"].toString();
+        article.source = item["source"].toString();
+        article.region = item["region"].toString("GLOBAL");
+        article.category = item["category"].toString("GEOPOLITICS");
+        article.link = item["link"].toString();
+        article.sort_ts = item["sort_ts"].toVariant().toLongLong();
+        article.time = QDateTime::fromSecsSinceEpoch(article.sort_ts).toString(Qt::ISODate);
+        article.tier = item["tier"].toInt(2);
+        article.lang = item["lang"].toString("en");
+        articles.append(article);
+    }
+    return articles;
+}
+
+QVector<NewsEvent> merge_events(const QVector<NewsEvent>& primary, const QVector<NewsEvent>& extra, int limit) {
+    QVector<NewsEvent> merged = primary;
+    QSet<QString> seen;
+
+    auto key_for = [](const NewsEvent& event) {
+        if (!event.url.isEmpty())
+            return event.url;
+        return event.event_category + "|" + event.country + "|" + event.city + "|" + event.matched_keywords.left(120);
+    };
+
+    for (const auto& event : primary)
+        seen.insert(key_for(event));
+
+    for (const auto& event : extra) {
+        const QString key = key_for(event);
+        if (seen.contains(key))
+            continue;
+        seen.insert(key);
+        merged.append(event);
+    }
+
+    std::sort(merged.begin(), merged.end(), [](const NewsEvent& a, const NewsEvent& b) {
+        return a.created_at > b.created_at;
+    });
+    if (limit > 0 && merged.size() > limit)
+        merged.resize(limit);
+    return merged;
 }
 
 QVector<NewsEvent> build_local_events(const QVector<fincept::services::NewsArticle>& articles, const QString& country_filter,
@@ -164,45 +278,73 @@ void GeopoliticsService::run_python(const QString& script, const QStringList& ar
 // ═══════════════════════════════════════════════════════════════════════════════
 
 void GeopoliticsService::fetch_events(const QString& country, const QString& city, const QString& category, int limit) {
+    const QString cache_key = event_cache_key(country, city, category, limit);
+    const QVariant cached = fincept::CacheManager::instance().get(cache_key);
+    if (!cached.isNull()) {
+        const QJsonObject root = QJsonDocument::fromJson(cached_bytes(cached)).object();
+        const QVector<NewsEvent> cached_events = events_from_json(root["events"].toArray());
+        emit events_loaded(cached_events, root["total"].toInt(cached_events.size()));
+        if (hub_registered_)
+            publish_to_hub(QStringLiteral("geopolitics:events"), QVariant::fromValue(cached_events));
+        return;
+    }
+
     QPointer<GeopoliticsService> self = this;
     fincept::services::NewsService::instance().fetch_all_news(
         false, [self, country, city, category, limit](bool ok, QVector<fincept::services::NewsArticle> articles) {
         if (!self)
             return;
-        if (!ok) {
-            LOG_ERROR("Geopolitics", "Local events fetch failed");
-            emit self->error_occurred("events", "Local geopolitics feed unavailable");
+        QVector<NewsEvent> local_events;
+        if (ok)
+            local_events = build_local_events(articles, country, city, category, limit > 0 ? limit : 200);
+        else
+            LOG_WARN("Geopolitics", "Local events fetch failed, trying live search fallback");
+
+        auto publish_events = [self, country, city, category, limit](const QVector<NewsEvent>& events) {
+            if (!self)
+                return;
+            if (events.isEmpty()) {
+                emit self->error_occurred("events", "No local or live geopolitics events available");
+                return;
+            }
+
+            QJsonObject cached_root;
+            cached_root["events"] = events_to_json(events);
+            cached_root["total"] = events.size();
+            fincept::CacheManager::instance().put(
+                event_cache_key(country, city, category, limit),
+                QVariant(QJsonDocument(cached_root).toJson(QJsonDocument::Compact)), kEventsTtlSec, "geopolitics");
+            LOG_INFO("Geopolitics", QString("Loaded %1 events").arg(events.size()));
+            emit self->events_loaded(events, events.size());
+            if (self->hub_registered_)
+                publish_to_hub(QStringLiteral("geopolitics:events"), QVariant::fromValue(events));
+        };
+
+        if (!python::PythonRunner::instance().is_available()) {
+            publish_events(local_events);
             return;
         }
-        const QVector<NewsEvent> events = build_local_events(articles, country, city, category, limit);
-        const int total = events.size();
-        // Serialize events to JSON for CacheManager persistence
-        QJsonArray cached_arr;
-        for (const auto& ev : events) {
-            QJsonObject o;
-            o["url"] = ev.url;
-            o["domain"] = ev.domain;
-            o["event_category"] = ev.event_category;
-            o["matched_keywords"] = ev.matched_keywords;
-            o["city"] = ev.city;
-            o["country"] = ev.country;
-            o["latitude"] = ev.latitude;
-            o["longitude"] = ev.longitude;
-            o["extracted_date"] = ev.extracted_date;
-            o["created_at"] = ev.created_at;
-            cached_arr.append(o);
-        }
-        QJsonObject cached_root;
-        cached_root["events"] = cached_arr;
-        cached_root["total"] = total;
-        const QString cache_key = QString("geo:events:%1:%2:%3:%4").arg(country, city, category).arg(limit);
-        fincept::CacheManager::instance().put(cache_key,
-                                              QVariant(QJsonDocument(cached_root).toJson(QJsonDocument::Compact)),
-                                              kEventsTtlSec, "geopolitics");
-        LOG_INFO("Geopolitics", QString("Loaded %1 events").arg(events.size()));
-        emit self->events_loaded(events, total);
-        if (self->hub_registered_)
-            publish_to_hub(QStringLiteral("geopolitics:events"), QVariant::fromValue(events));
+
+        const int search_limit = limit > 0 ? qBound(5, limit, 40) : 20;
+        self->run_python(
+            "news_search_rss.py", {"geopolitics", country, city, category, QString::number(search_limit)},
+            "live_geopolitics_search",
+            [self, country, city, category, limit, local_events, publish_events](bool search_ok, const QString& output) {
+                if (!self)
+                    return;
+
+                QVector<NewsEvent> merged = local_events;
+                if (search_ok) {
+                    const QVector<fincept::services::NewsArticle> live_articles = parse_live_search_articles(output);
+                    const QVector<NewsEvent> live_events =
+                        build_local_events(live_articles, country, city, category, limit > 0 ? limit : 100);
+                    merged = merge_events(local_events, live_events, limit);
+                } else if (local_events.isEmpty()) {
+                    LOG_ERROR("Geopolitics", "Live geopolitics search failed: " + output.left(200));
+                }
+
+                publish_events(merged);
+            });
     });
 }
 

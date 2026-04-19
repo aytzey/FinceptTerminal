@@ -40,7 +40,7 @@ void ConflictMonitorPanel::build_ui() {
     // ── Events Table ────────────────────────────────────────────────────────
     events_table_ = new QTableWidget(left_splitter);
     events_table_->setColumnCount(7);
-    events_table_->setHorizontalHeaderLabels({"Category", "Country", "City", "Keywords", "Date", "Lat", "Lng"});
+    events_table_->setHorizontalHeaderLabels({"Category", "Country", "City", "Context", "Date", "Lat", "Lng"});
     events_table_->setEditTriggers(QAbstractItemView::NoEditTriggers);
     events_table_->setSelectionBehavior(QAbstractItemView::SelectRows);
     events_table_->setAlternatingRowColors(true);
@@ -87,6 +87,8 @@ void ConflictMonitorPanel::build_ui() {
         detail_city_->setText(get_text(2));
         detail_keywords_->setText(get_text(3));
         detail_date_->setText(get_text(4));
+        detail_source_->setText(events_table_->item(row, 0) ? events_table_->item(row, 0)->data(Qt::UserRole + 1).toString()
+                                                            : QString());
 
         auto cat_color = category_color(get_text(0));
         detail_category_->setStyleSheet(QString("color:%1; font-size:%2px; font-weight:700; font-family:%3;")
@@ -95,6 +97,13 @@ void ConflictMonitorPanel::build_ui() {
                                             .arg(ui::fonts::DATA_FAMILY));
 
         detail_panel_->setVisible(true);
+    });
+    connect(events_table_, &QTableWidget::cellDoubleClicked, this, [this](int row, int) {
+        if (row < 0 || !events_table_->item(row, 0))
+            return;
+        const QString url = events_table_->item(row, 0)->data(Qt::UserRole).toString();
+        if (!url.isEmpty())
+            QDesktopServices::openUrl(QUrl(url));
     });
     left_splitter->addWidget(events_table_);
 
@@ -182,7 +191,7 @@ void ConflictMonitorPanel::build_ui() {
     };
     FieldDef fields[] = {
         {"CATEGORY", &detail_category_}, {"COUNTRY", &detail_country_}, {"CITY", &detail_city_},
-        {"KEYWORDS", &detail_keywords_}, {"DATE", &detail_date_},       {"SOURCE", &detail_source_},
+        {"CONTEXT", &detail_keywords_}, {"DATE", &detail_date_},       {"SOURCE", &detail_source_},
     };
 
     for (int r = 0; r < 6; ++r) {
@@ -213,6 +222,8 @@ void ConflictMonitorPanel::set_events(const QVector<NewsEvent>& events) {
 
         auto* cat_item = new QTableWidgetItem(ev.event_category);
         cat_item->setForeground(category_color(ev.event_category));
+        cat_item->setData(Qt::UserRole, ev.url);
+        cat_item->setData(Qt::UserRole + 1, ev.domain);
         events_table_->setItem(i, 0, cat_item);
 
         events_table_->setItem(i, 1, new QTableWidgetItem(ev.country));
