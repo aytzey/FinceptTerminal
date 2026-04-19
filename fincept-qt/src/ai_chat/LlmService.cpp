@@ -555,12 +555,20 @@ void LlmService::ensure_config() const {
         }
     }
 
-    // Fallback: if no provider configured, use Fincept with session API key
+    // Fallback: if no provider configured, prefer Codex OAuth when available.
     if (provider_.isEmpty()) {
-        provider_ = "fincept";
-        model_ = "MiniMax-M2.7";
-        base_url_ = {};
-        LOG_INFO(TAG, "No LLM provider configured — using Fincept default");
+        if (has_codex_oauth_auth()) {
+            provider_ = CODEX_PROVIDER;
+            model_ = "gpt-5.3-codex";
+            base_url_ = {};
+            reasoning_effort_ = "medium";
+            LOG_INFO(TAG, "No LLM provider configured — using Codex OAuth default");
+        } else {
+            provider_ = "fincept";
+            model_ = "MiniMax-M2.7";
+            base_url_ = {};
+            LOG_INFO(TAG, "No LLM provider configured — using Fincept default");
+        }
     }
 
     // Fincept always resolves API key from session (never stored in llm_configs)

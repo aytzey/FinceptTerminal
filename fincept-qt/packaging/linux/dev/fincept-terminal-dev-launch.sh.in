@@ -26,4 +26,5 @@ if [ "$needs_build" -eq 1 ]; then
 fi
 
 cd "$APP_DIR"
+export FINCEPT_DEV_SKIP_AUTH=1
 exec "$BIN" "$@"

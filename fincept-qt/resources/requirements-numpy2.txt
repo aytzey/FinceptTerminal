@@ -155,4 +155,5 @@ mplfinance>=0.12.0
 
 # Voice recognition (speech-to-text via Google API)
 SpeechRecognition>=3.10.0
-PyAudio>=0.2.14
+# Optional native audio capture backend. Kept out of the default bootstrap
+# because PortAudio toolchain availability varies across developer machines.

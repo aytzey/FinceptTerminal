@@ -103,6 +103,15 @@
 
 namespace fincept {
 
+namespace {
+
+bool dev_skip_auth_enabled() {
+    const QByteArray raw = qgetenv("FINCEPT_DEV_SKIP_AUTH").trimmed().toLower();
+    return raw == "1" || raw == "true" || raw == "yes" || raw == "on";
+}
+
+} // namespace
+
 MainWindow::MainWindow(int window_id, QWidget* parent) : QMainWindow(parent), window_id_(window_id) {
     // Show active profile in title bar when using a non-default profile
     const QString profile = ProfileManager::instance().active();
@@ -584,8 +593,35 @@ MainWindow::MainWindow(int window_id, QWidget* parent) : QMainWindow(parent), wi
     // Show the app or auth stack based on authentication state.
     // If dock layout was restored, the saved tabs are already visible.
     // Otherwise, navigate to dashboard as default.
+    auto restore_last_focused_screen = [this, dock_restored]() {
+        if (!dock_restored) {
+            dock_router_->navigate("dashboard");
+            LOG_INFO("MainWindow", "Applied clean default dock layout");
+            return;
+        }
+
+        const QString last = SessionManager::instance().last_screen();
+        if (last.isEmpty())
+            return;
+
+        auto* dw = dock_router_->find_dock_widget(last);
+        if (dw && !dw->isClosed()) {
+            dw->raise();
+            dw->setAsCurrentTab();
+        }
+        tab_bar_->set_active(last);
+    };
+
     auto& auth_mgr = auth::AuthManager::instance();
-    if (auth_mgr.is_authenticated() || auth_mgr.is_loading()) {
+    if (dev_skip_auth_enabled()) {
+        LOG_INFO("MainWindow", "FINCEPT_DEV_SKIP_AUTH enabled — bypassing auth, PIN, and pricing gates");
+        locked_ = false;
+        pin_gate_cleared_ = true;
+        auth::InactivityGuard::instance().set_enabled(false);
+        set_shell_visible(true);
+        stack_->setCurrentIndex(1);
+        restore_last_focused_screen();
+    } else if (auth_mgr.is_authenticated() || auth_mgr.is_loading()) {
         // If user is authenticated and has a PIN, show lock screen first.
         // If no PIN, on_auth_state_changed will route to PIN setup.
         if (auth_mgr.is_authenticated() && auth::PinManager::instance().has_pin()) {
@@ -602,21 +638,7 @@ MainWindow::MainWindow(int window_id, QWidget* parent) : QMainWindow(parent), wi
             set_shell_visible(true);
             stack_->setCurrentIndex(1);
         }
-        if (!dock_restored) {
-            dock_router_->navigate("dashboard");
-            LOG_INFO("MainWindow", "Applied clean default dock layout");
-        } else {
-            // Restore last-active screen as the focused tab and sync tab bar
-            const QString last = SessionManager::instance().last_screen();
-            if (!last.isEmpty()) {
-                auto* dw = dock_router_->find_dock_widget(last);
-                if (dw && !dw->isClosed()) {
-                    dw->raise();
-                    dw->setAsCurrentTab();
-                }
-                tab_bar_->set_active(last);
-            }
-        }
+        restore_last_focused_screen();
     } else {
         on_auth_state_changed();
     }
@@ -853,6 +875,21 @@ void MainWindow::setup_navigation() {}
 
 void MainWindow::on_auth_state_changed() {
     auto& auth = auth::AuthManager::instance();
+
+    if (dev_skip_auth_enabled()) {
+        locked_ = false;
+        pin_gate_cleared_ = true;
+        auth::InactivityGuard::instance().set_enabled(false);
+        set_shell_visible(true);
+        if (stack_->currentIndex() != 1 && stack_->currentIndex() != 2)
+            stack_->setCurrentIndex(1);
+
+        const QString current = dock_router_->current_screen_id();
+        if (current.isEmpty())
+            dock_router_->navigate(SessionManager::instance().last_screen().isEmpty() ? "dashboard"
+                                                                                      : SessionManager::instance().last_screen());
+        return;
+    }
 
     // If logged out while the lock screen is active (e.g. max PIN attempts → reauth),
     // clear locked_ so the login screen can show. Otherwise stay on the lock screen.
