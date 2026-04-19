@@ -41,10 +41,14 @@ AuthManager& AuthManager::instance() {
 AuthManager::AuthManager() {}
 
 bool AuthManager::has_fincept_api_key() const {
+    if (has_local_runtime())
+        return false;
     return !session_.api_key.isEmpty();
 }
 
 QString AuthManager::effective_api_key() const {
+    if (has_local_runtime())
+        return {};
     return session_.api_key;
 }
 

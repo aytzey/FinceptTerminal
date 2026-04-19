@@ -12,6 +12,10 @@ SessionGuard::SessionGuard(QObject* parent) : QObject(parent) {
     connect(&timer_, &QTimer::timeout, this, &SessionGuard::check_pulse);
 
     connect(&AuthManager::instance(), &AuthManager::auth_state_changed, this, [this]() {
+        if (AuthManager::instance().has_local_runtime()) {
+            stop();
+            return;
+        }
         const auto& s = AuthManager::instance().session();
         if (s.authenticated && AuthManager::instance().has_fincept_api_key()) {
             start();
@@ -33,6 +37,8 @@ void SessionGuard::stop() {
 }
 
 void SessionGuard::check_pulse() {
+    if (AuthManager::instance().has_local_runtime())
+        return;
     const auto& s = AuthManager::instance().session();
     if (!s.authenticated || !AuthManager::instance().has_fincept_api_key())
         return;
