@@ -1,5 +1,6 @@
 #include "services/news/NewsService.h"
 
+#include "ai_chat/LlmService.h"
 #include "core/logging/Logger.h"
 #include "python/PythonRunner.h"
 #include "storage/cache/CacheManager.h"
@@ -10,16 +11,19 @@
 #include <QAtomicInt>
 #include <QDateTime>
 #include <QEventLoop>
+#include <QHash>
 #include <QJsonDocument>
 #include <QMap>
+#include <QMetaObject>
 #include <QMutex>
 #include <QMutexLocker>
 #include <QNetworkRequest>
+#include <QPointer>
 #include <QRegularExpression>
 #include <QSet>
 #include <QTimer>
-#include <QUuid>
 #include <QXmlStreamReader>
+#include <QtConcurrent>
 
 #ifdef HAS_QT_WEBSOCKETS
 #    include <QtWebSockets/QWebSocket>
@@ -33,6 +37,8 @@ namespace fincept::services {
 static constexpr int kFeedTransferTimeoutMs = 5000;   // 5s per RSS feed request
 static constexpr int kWsReconnectDelayMs    = 10000;  // 10s before WebSocket reconnect
 static constexpr int kSummaryMaxChars       = 300;    // max chars for article summary
+static constexpr int kNewsArticlesCacheTtlSec = 600;  // 10 min
+static constexpr const char* kNewsArticlesCacheKey = "news:articles:v2";
 
 namespace {
 
@@ -44,6 +50,8 @@ struct ArticleSnapshot {
     QString source;
     QString error;
 };
+
+using ArticlesTransformCallback = std::function<void(QVector<NewsArticle>)>;
 
 QString decode_html_entities(QString text) {
     static const QMap<QString, QString> replacements = {
@@ -144,130 +152,238 @@ ArticleSnapshot fetch_article_snapshot(QNetworkAccessManager* nam, const QString
     return snapshot;
 }
 
-QStringList top_terms(const QString& text, int limit = 8) {
-    static const QSet<QString> stop_words = {
-        "about", "after", "again", "against", "among", "also", "been", "before", "being", "between",
-        "could", "their", "there", "these", "those", "this", "that", "with", "from", "into", "because",
-        "while", "where", "which", "would", "should", "market", "markets", "company", "companies", "says",
-        "said", "report", "reports", "news", "latest", "today", "update", "will", "have", "has", "more",
-        "than", "over", "under", "into", "amid", "amidst", "year", "years", "quarter", "shares", "stock",
-        "global", "world", "business", "finance", "financial", "according", "statement",
-    };
-    static const QRegularExpression word_re(R"(\b[a-zA-Z][a-zA-Z-]{3,}\b)");
-
-    QMap<QString, int> counts;
-    auto it = word_re.globalMatch(text.toLower());
-    while (it.hasNext()) {
-        const QString token = it.next().captured().toLower();
-        if (stop_words.contains(token))
-            continue;
-        counts[token] += 1;
+QString clean_llm_text(QString text) {
+    text = text.trimmed();
+    if (text.startsWith("```")) {
+        text.remove(QRegularExpression(R"(^```[a-zA-Z0-9_-]*\s*)"));
+        text.remove(QRegularExpression(R"(\s*```$)"));
     }
+    return text.trimmed();
+}
 
-    QList<QPair<QString, int>> ranked;
-    ranked.reserve(counts.size());
-    for (auto it2 = counts.begin(); it2 != counts.end(); ++it2)
-        ranked.append({it2.key(), it2.value()});
-    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
-        if (a.second != b.second)
-            return a.second > b.second;
-        return a.first < b.first;
-    });
+QString article_lines_for_prompt(const QVector<NewsArticle>& articles, int count) {
+    QStringList lines;
+    const int take = std::min(count, static_cast<int>(articles.size()));
+    lines.reserve(take);
+    for (int i = 0; i < take; ++i) {
+        const auto& a = articles[i];
+        lines << QString("%1. [%2/%3/%4] %5 - %6")
+                     .arg(i + 1)
+                     .arg(a.source.left(40), a.category.left(24), sentiment_string(a.sentiment))
+                     .arg(a.headline.left(220), a.summary.left(260));
+    }
+    return lines.join('\n');
+}
 
+QString build_headline_brief_prompt(const QVector<NewsArticle>& articles, int count) {
+    return QString(
+               "Write a concise professional market-news brief from these headlines.\n"
+               "Use only the supplied items. Do not invent prices, facts, or causality.\n"
+               "Focus on market drivers, cross-asset implications, and watch items.\n"
+               "Return 4 short bullets, no markdown heading, no preamble.\n\n"
+               "%1")
+        .arg(article_lines_for_prompt(articles, count));
+}
+
+QString build_article_analysis_prompt(const ArticleSnapshot& snapshot, const QString& url) {
+    const QString body = snapshot.body.left(6000);
+    return QString(
+               "Analyze this financial news article for a trading terminal.\n"
+               "Use only the article text. If evidence is weak, say so in the relevant details.\n"
+               "Return JSON only with this schema:\n"
+               "{"
+               "\"summary\":\"2-3 sentence market interpretation\","
+               "\"sentiment_score\":0,"
+               "\"sentiment_intensity\":0,"
+               "\"sentiment_confidence\":0,"
+               "\"market_urgency\":\"LOW|MEDIUM|HIGH\","
+               "\"market_prediction\":\"negative|neutral|moderate_positive|positive\","
+               "\"keywords\":[\"...\"],"
+               "\"topics\":[\"...\"],"
+               "\"key_points\":[\"...\"],"
+               "\"regulatory\":{\"level\":\"LOW|MEDIUM|HIGH\",\"details\":\"...\"},"
+               "\"geopolitical\":{\"level\":\"LOW|MEDIUM|HIGH\",\"details\":\"...\"},"
+               "\"operational\":{\"level\":\"LOW|MEDIUM|HIGH\",\"details\":\"...\"},"
+               "\"market\":{\"level\":\"LOW|MEDIUM|HIGH\",\"details\":\"...\"}"
+               "}.\n\n"
+               "URL: %1\n"
+               "Source: %2\n"
+               "Title: %3\n"
+               "Summary: %4\n"
+               "Body: %5")
+        .arg(url.left(500), snapshot.source.left(120), snapshot.title.left(300), snapshot.summary.left(800), body);
+}
+
+QStringList string_array_from_json(const QJsonValue& value, int limit) {
     QStringList out;
-    for (const auto& item : ranked) {
-        out.append(item.first);
+    for (const auto& item : value.toArray()) {
+        const QString text = item.toString().trimmed();
+        if (!text.isEmpty())
+            out << text.left(180);
         if (out.size() >= limit)
             break;
     }
     return out;
 }
 
-RiskSignal classify_signal(const QString& text, const QStringList& high_keywords, const QStringList& medium_keywords,
-                           const QString& high_detail, const QString& medium_detail) {
-    for (const auto& keyword : high_keywords) {
-        if (text.contains(keyword))
-            return {"HIGH", high_detail};
+QString normalized_choice(QString value, const QStringList& allowed, const QString& fallback) {
+    value = value.trimmed();
+    const QString upper = value.toUpper();
+    for (const auto& item : allowed) {
+        if (upper == item.toUpper())
+            return item;
     }
-    for (const auto& keyword : medium_keywords) {
-        if (text.contains(keyword))
-            return {"MEDIUM", medium_detail};
-    }
-    return {"LOW", "No prominent local signal detected"};
+    return fallback;
 }
 
-QStringList derive_topics(const NewsArticle& article, const QString& text) {
-    QStringList topics;
-    if (!article.category.isEmpty())
-        topics << article.category.toLower();
-    if (text.contains("inflation") || text.contains("central bank") || text.contains("interest rate"))
-        topics << "macro";
-    if (text.contains("earnings") || text.contains("guidance") || text.contains("quarter"))
-        topics << "earnings";
-    if (text.contains("sanction") || text.contains("military") || text.contains("conflict"))
-        topics << "geopolitics";
-    if (text.contains("merger") || text.contains("acquisition"))
-        topics << "m&a";
-    if (text.contains("oil") || text.contains("gas") || text.contains("opec"))
-        topics << "energy";
-    topics.removeDuplicates();
-    return topics.mid(0, 6);
+RiskSignal risk_signal_from_json(const QJsonValue& value) {
+    const auto obj = value.toObject();
+    RiskSignal signal;
+    signal.level = normalized_choice(obj.value("level").toString(), {"LOW", "MEDIUM", "HIGH"}, "LOW");
+    signal.details = obj.value("details").toString().trimmed().left(260);
+    if (signal.details.isEmpty())
+        signal.details = "No material signal identified in the article text.";
+    return signal;
 }
 
-QString impact_prediction(const NewsArticle& article) {
-    if (article.sentiment == Sentiment::BEARISH && article.impact == Impact::HIGH)
-        return "negative";
-    if (article.sentiment == Sentiment::BULLISH && article.impact == Impact::HIGH)
-        return "positive";
-    if (article.sentiment == Sentiment::BULLISH)
-        return "moderate_positive";
-    if (article.sentiment == Sentiment::BEARISH)
-        return "moderate_negative";
-    return "neutral";
+bool analysis_from_llm_json(const QString& content, NewsAnalysis& analysis) {
+    QJsonParseError parse_error;
+    const QString json_text = python::extract_json(clean_llm_text(content));
+    const auto doc = QJsonDocument::fromJson(json_text.toUtf8(), &parse_error);
+    if (parse_error.error != QJsonParseError::NoError || !doc.isObject())
+        return false;
+
+    const auto obj = doc.object();
+    analysis.summary = obj.value("summary").toString().trimmed().left(1000);
+    analysis.sentiment.score = std::clamp(obj.value("sentiment_score").toDouble(0.0), -1.0, 1.0);
+    analysis.sentiment.intensity = std::clamp(obj.value("sentiment_intensity").toDouble(0.0), 0.0, 1.0);
+    analysis.sentiment.confidence = std::clamp(obj.value("sentiment_confidence").toDouble(0.0), 0.0, 1.0);
+    analysis.market_impact.urgency =
+        normalized_choice(obj.value("market_urgency").toString(), {"LOW", "MEDIUM", "HIGH"}, "LOW");
+    analysis.market_impact.prediction = normalized_choice(
+        obj.value("market_prediction").toString(),
+        {"negative", "neutral", "moderate_positive", "positive"}, "neutral");
+    analysis.keywords = string_array_from_json(obj.value("keywords"), 10);
+    analysis.topics = string_array_from_json(obj.value("topics"), 8);
+    analysis.key_points = string_array_from_json(obj.value("key_points"), 6);
+    analysis.regulatory = risk_signal_from_json(obj.value("regulatory"));
+    analysis.geopolitical = risk_signal_from_json(obj.value("geopolitical"));
+    analysis.operational = risk_signal_from_json(obj.value("operational"));
+    analysis.market = risk_signal_from_json(obj.value("market"));
+    analysis.credits_used = 0;
+    analysis.credits_remaining = 0;
+    return !analysis.summary.isEmpty() || !analysis.key_points.isEmpty();
 }
 
-QString build_local_summary(const QVector<NewsArticle>& articles, int count) {
-    const int take = std::min(count, static_cast<int>(articles.size()));
-    if (take <= 0)
-        return {};
+QJsonArray articles_to_nlp_json(const QVector<NewsArticle>& articles) {
+    QJsonArray arr;
+    for (const auto& article : articles) {
+        QJsonObject obj;
+        obj["id"] = article.id;
+        obj["headline"] = article.headline;
+        obj["summary"] = article.summary;
+        obj["source"] = article.source;
+        obj["category"] = article.category;
+        obj["region"] = article.region;
+        obj["sort_ts"] = static_cast<qint64>(article.sort_ts);
+        arr.append(obj);
+    }
+    return arr;
+}
 
-    QMap<QString, int> categories;
-    int bullish = 0;
-    int bearish = 0;
-    int neutral = 0;
-    QStringList top_headlines;
+Sentiment model_sentiment_from_string(const QString& value) {
+    const QString normalized = value.trimmed().toUpper();
+    if (normalized == "BULLISH")
+        return Sentiment::BULLISH;
+    if (normalized == "BEARISH")
+        return Sentiment::BEARISH;
+    return Sentiment::NEUTRAL;
+}
 
-    for (int i = 0; i < take; ++i) {
-        const auto& article = articles[i];
-        categories[article.category.isEmpty() ? "OTHER" : article.category] += 1;
-        if (article.sentiment == Sentiment::BULLISH)
-            ++bullish;
-        else if (article.sentiment == Sentiment::BEARISH)
-            ++bearish;
-        else
-            ++neutral;
-        if (top_headlines.size() < 3)
-            top_headlines << article.headline;
+void recompute_threats(QVector<NewsArticle>& articles) {
+    for (auto& article : articles)
+        article.threat = NewsService::classify_threat(article);
+}
+
+void apply_finbert_sentiment(QVector<NewsArticle> articles, ArticlesTransformCallback cb) {
+    for (auto& article : articles)
+        article.sentiment = Sentiment::NEUTRAL;
+
+    if (articles.isEmpty() || !python::PythonRunner::instance().is_available()) {
+        recompute_threats(articles);
+        cb(std::move(articles));
+        return;
     }
 
-    QList<QPair<QString, int>> ranked_categories;
-    for (auto it = categories.begin(); it != categories.end(); ++it)
-        ranked_categories.append({it.key(), it.value()});
-    std::sort(ranked_categories.begin(), ranked_categories.end(),
-              [](const auto& a, const auto& b) { return a.second > b.second; });
+    const QString json = QString::fromUtf8(QJsonDocument(articles_to_nlp_json(articles)).toJson(QJsonDocument::Compact));
+    python::PythonRunner::instance().run(
+        "news_nlp.py", {"analyze_sentiment_batch", json},
+        [articles = std::move(articles), cb = std::move(cb)](python::PythonResult result) mutable {
+            if (!result.success) {
+                LOG_WARN("NewsService", "FinBERT sentiment unavailable: " + result.error.left(180));
+                recompute_threats(articles);
+                cb(std::move(articles));
+                return;
+            }
 
-    QStringList leading;
-    for (int i = 0; i < std::min(2, static_cast<int>(ranked_categories.size())); ++i)
-        leading << QString("%1 (%2)").arg(ranked_categories[i].first).arg(ranked_categories[i].second);
+            const auto doc = QJsonDocument::fromJson(python::extract_json(result.output).toUtf8());
+            const auto obj = doc.object();
+            if (!obj.value("success").toBool()) {
+                LOG_WARN("NewsService", "FinBERT sentiment failed: " + obj.value("error").toString().left(180));
+                recompute_threats(articles);
+                cb(std::move(articles));
+                return;
+            }
 
-    return QString("%1 headline scanned. Leading themes: %2. Tone: %3 bullish, %4 bearish, %5 neutral. "
-                   "Key items: %6.")
-        .arg(take)
-        .arg(leading.join(", "))
-        .arg(bullish)
-        .arg(bearish)
-        .arg(neutral)
-        .arg(top_headlines.join(" | "));
+            QHash<QString, int> article_index;
+            article_index.reserve(articles.size());
+            for (int i = 0; i < articles.size(); ++i)
+                article_index.insert(articles[i].id, i);
+
+            for (const auto& value : obj.value("results").toArray()) {
+                const auto item = value.toObject();
+                const QString id = item.value("id").toString();
+                const auto it = article_index.find(id);
+                if (it == article_index.end())
+                    continue;
+                articles[it.value()].sentiment = model_sentiment_from_string(item.value("sentiment").toString());
+            }
+
+            recompute_threats(articles);
+            cb(std::move(articles));
+        });
+}
+
+QJsonObject article_to_cache_json(const NewsArticle& article) {
+    QJsonObject obj;
+    obj["id"] = article.id;
+    obj["time"] = article.time;
+    obj["headline"] = article.headline;
+    obj["summary"] = article.summary;
+    obj["source"] = article.source;
+    obj["region"] = article.region;
+    obj["category"] = article.category;
+    obj["link"] = article.link;
+    obj["sort_ts"] = static_cast<qint64>(article.sort_ts);
+    obj["tier"] = article.tier;
+    obj["priority"] = priority_string(article.priority);
+    obj["sentiment"] = sentiment_string(article.sentiment);
+    obj["impact"] = impact_string(article.impact);
+    obj["lang"] = article.lang;
+    QJsonArray tickers;
+    for (const auto& ticker : article.tickers)
+        tickers.append(ticker);
+    obj["tickers"] = tickers;
+    return obj;
+}
+
+void cache_news_articles(const QVector<NewsArticle>& articles) {
+    QJsonArray arr;
+    for (const auto& article : articles)
+        arr.append(article_to_cache_json(article));
+    fincept::CacheManager::instance().put(
+        kNewsArticlesCacheKey, QVariant(QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact))),
+        kNewsArticlesCacheTtlSec, "news");
 }
 
 } // namespace
@@ -291,7 +407,7 @@ NewsService::NewsService() {
 
 void NewsService::fetch_all_news(bool force, ArticlesCallback cb) {
     if (!force) {
-        const QVariant cached = fincept::CacheManager::instance().get("news:articles");
+        const QVariant cached = fincept::CacheManager::instance().get(kNewsArticlesCacheKey);
         if (!cached.isNull()) {
             const QJsonArray arr = QJsonDocument::fromJson(cached.toString().toUtf8()).array();
             QVector<NewsArticle> articles;
@@ -365,49 +481,27 @@ void NewsService::fetch_all_news(bool force, ArticlesCallback cb) {
 
             if (state->remaining.fetchAndSubRelaxed(1) == 1) {
                 // Last feed done — sort by time descending
-                auto& all = state->all_articles;
+                auto all = state->all_articles;
                 std::sort(all.begin(), all.end(),
                           [](const NewsArticle& a, const NewsArticle& b) { return a.sort_ts > b.sort_ts; });
 
-                QSet<QString> sources;
-                for (const auto& a : all)
-                    sources.insert(a.source);
-                state->service->active_sources_ = sources.values();
+                apply_finbert_sentiment(std::move(all), [state](QVector<NewsArticle> refined) {
+                    QSet<QString> sources;
+                    for (const auto& a : refined)
+                        sources.insert(a.source);
+                    state->service->active_sources_ = sources.values();
 
-                // Serialize to CacheManager
-                QJsonArray arr;
-                for (const auto& a : all) {
-                    QJsonObject o;
-                    o["id"] = a.id;
-                    o["time"] = a.time;
-                    o["headline"] = a.headline;
-                    o["summary"] = a.summary;
-                    o["source"] = a.source;
-                    o["region"] = a.region;
-                    o["category"] = a.category;
-                    o["link"] = a.link;
-                    o["sort_ts"] = static_cast<qint64>(a.sort_ts);
-                    o["tier"] = a.tier;
-                    o["priority"] = priority_string(a.priority);
-                    o["sentiment"] = sentiment_string(a.sentiment);
-                    o["impact"] = impact_string(a.impact);
-                    o["lang"] = a.lang;
-                    QJsonArray tickers;
-                    for (const auto& t : a.tickers)
-                        tickers.append(t);
-                    o["tickers"] = tickers;
-                    arr.append(o);
-                }
-                fincept::CacheManager::instance().put(
-                    "news:articles", QVariant(QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact))),
-                    kArticleCacheTtlSec, "news");
+                    cache_news_articles(refined);
 
-                LOG_INFO("NewsService",
-                         QString("Fetched %1 articles from %2 sources").arg(all.size()).arg(sources.size()));
+                    LOG_INFO("NewsService",
+                             QString("Fetched %1 articles from %2 sources with FinBERT sentiment")
+                                 .arg(refined.size())
+                                 .arg(sources.size()));
 
-                state->callback(true, all);
-                emit state->service->articles_updated(all);
-                state->service->publish_articles_to_hub(all);
+                    state->callback(true, refined);
+                    emit state->service->articles_updated(refined);
+                    state->service->publish_articles_to_hub(refined);
+                });
             }
         });
     }
@@ -419,7 +513,7 @@ void NewsService::fetch_all_news(bool force, ArticlesCallback cb) {
 
 void NewsService::fetch_all_news_progressive(bool force, ArticlesCallback final_cb) {
     if (!force) {
-        const QVariant cached = fincept::CacheManager::instance().get("news:articles");
+        const QVariant cached = fincept::CacheManager::instance().get(kNewsArticlesCacheKey);
         if (!cached.isNull()) {
             const QJsonArray arr = QJsonDocument::fromJson(cached.toString().toUtf8()).array();
             QVector<NewsArticle> articles;
@@ -506,131 +600,76 @@ void NewsService::fetch_all_news_progressive(bool force, ArticlesCallback final_
 
             if (state->remaining.fetchAndSubRelaxed(1) == 1) {
                 // All feeds done — finalize cache
-                auto& all = state->all_articles;
+                auto all = state->all_articles;
                 std::sort(all.begin(), all.end(),
                           [](const NewsArticle& a, const NewsArticle& b) { return a.sort_ts > b.sort_ts; });
 
-                QSet<QString> sources;
-                for (const auto& a : all)
-                    sources.insert(a.source);
-                state->service->active_sources_ = sources.values();
+                apply_finbert_sentiment(std::move(all), [state, total](QVector<NewsArticle> refined) {
+                    QSet<QString> sources;
+                    for (const auto& a : refined)
+                        sources.insert(a.source);
+                    state->service->active_sources_ = sources.values();
 
-                QJsonArray parr;
-                for (const auto& a : all) {
-                    QJsonObject o;
-                    o["id"] = a.id;
-                    o["time"] = a.time;
-                    o["headline"] = a.headline;
-                    o["summary"] = a.summary;
-                    o["source"] = a.source;
-                    o["region"] = a.region;
-                    o["category"] = a.category;
-                    o["link"] = a.link;
-                    o["sort_ts"] = static_cast<qint64>(a.sort_ts);
-                    o["tier"] = a.tier;
-                    o["priority"] = priority_string(a.priority);
-                    o["sentiment"] = sentiment_string(a.sentiment);
-                    o["impact"] = impact_string(a.impact);
-                    o["lang"] = a.lang;
-                    QJsonArray tickers;
-                    for (const auto& t : a.tickers)
-                        tickers.append(t);
-                    o["tickers"] = tickers;
-                    parr.append(o);
-                }
-                fincept::CacheManager::instance().put(
-                    "news:articles", QVariant(QString::fromUtf8(QJsonDocument(parr).toJson(QJsonDocument::Compact))),
-                    kArticleCacheTtlSec, "news");
+                    cache_news_articles(refined);
 
-                LOG_INFO(
-                    "NewsService",
-                    QString("Progressive fetch complete: %1 articles, %2 sources").arg(all.size()).arg(sources.size()));
+                    LOG_INFO("NewsService",
+                             QString("Progressive fetch complete: %1 articles, %2 sources with FinBERT sentiment")
+                                 .arg(refined.size())
+                                 .arg(sources.size()));
 
-                state->callback(true, all);
-                emit state->service->articles_updated(all);
-                state->service->publish_articles_to_hub(all);
+                    emit state->service->articles_partial(refined, total, total);
+                    state->callback(true, refined);
+                    emit state->service->articles_updated(refined);
+                    state->service->publish_articles_to_hub(refined);
+                });
             }
         });
     }
 }
 
-// ── Local Article Analysis ──────────────────────────────────────────────────
+// ── Codex Article Analysis ─────────────────────────────────────────────────
 
 void NewsService::analyze_article(const QString& url, AnalysisCallback cb) {
     const QString trimmed_url = url.trimmed();
-    auto build_local_analysis = [this, trimmed_url](const ArticleSnapshot& snapshot) {
-        NewsArticle article;
-        article.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
-        article.link = trimmed_url;
-        article.headline = snapshot.title.left(200);
-        article.summary = snapshot.summary.left(kSummaryMaxChars);
-        article.source = snapshot.source.isEmpty() ? QUrl(trimmed_url).host().toUpper() : snapshot.source.left(80);
-        article.category = "MARKETS";
-        article.region = "GLOBAL";
-        article.time = QDateTime::currentDateTime().toString("MMM dd, HH:mm");
-        article.sort_ts = QDateTime::currentSecsSinceEpoch();
-        enrich_article(article);
-
-        const QString combined_text = (snapshot.title + " " + snapshot.summary + " " + snapshot.body).toLower();
-
-        NewsAnalysis analysis;
-        analysis.sentiment.score =
-            article.sentiment == Sentiment::BULLISH ? 0.6 : article.sentiment == Sentiment::BEARISH ? -0.6 : 0.0;
-        analysis.sentiment.intensity =
-            article.impact == Impact::HIGH ? 0.9 : article.impact == Impact::MEDIUM ? 0.6 : 0.3;
-        analysis.sentiment.confidence = std::max(0.45, article.threat.confidence);
-        analysis.market_impact.urgency = impact_string(article.impact);
-        analysis.market_impact.prediction = impact_prediction(article);
-        analysis.summary = snapshot.summary.isEmpty() ? snapshot.body.left(kSummaryMaxChars) : snapshot.summary;
-        analysis.keywords = top_terms(snapshot.title + " " + snapshot.summary + " " + snapshot.body, 8);
-        analysis.topics = derive_topics(article, combined_text);
-        analysis.key_points << snapshot.title;
-        if (!analysis.summary.isEmpty())
-            analysis.key_points << analysis.summary.left(180);
-        if (!article.tickers.isEmpty())
-            analysis.key_points << (QStringLiteral("Potentially affected tickers: ") + article.tickers.join(", "));
-        else
-            analysis.key_points << QString("Detected category: %1").arg(article.category);
-
-        analysis.regulatory = classify_signal(
-            combined_text,
-            {"sec", "antitrust", "sanction", "embargo", "lawsuit", "regulator", "investigation"},
-            {"policy", "tariff", "compliance", "probe"},
-            "Regulatory or legal friction appears prominent in the article",
-            "Regulatory follow-through may matter if the story develops");
-        analysis.geopolitical = classify_signal(
-            combined_text,
-            {"war", "missile", "military", "airstrike", "border", "sanction", "ceasefire"},
-            {"election", "diplomatic", "protest", "tension", "summit"},
-            "Geopolitical escalation markers were detected in the article",
-            "Geopolitical context is present but not dominant");
-        analysis.operational = classify_signal(
-            combined_text,
-            {"outage", "strike", "shutdown", "recall", "cyberattack", "disruption", "shortage"},
-            {"delay", "maintenance", "supply chain", "logistics"},
-            "Operational disruption risk is elevated",
-            "Operational execution may need monitoring");
-        analysis.market = classify_signal(
-            combined_text,
-            {"recession", "bankruptcy", "earnings miss", "flash crash", "trading halt", "downgrade"},
-            {"inflation", "rate", "volatility", "selloff", "guidance"},
-            "Market-sensitive downside catalysts were detected",
-            "Macro or market sensitivity is visible in the story");
-        analysis.credits_used = 0;
-        analysis.credits_remaining = 0;
-        return analysis;
-    };
-
-    auto finish_with_snapshot = [this, cb, build_local_analysis](const ArticleSnapshot& snapshot) {
+    auto finish_with_snapshot = [this, cb, trimmed_url](const ArticleSnapshot& snapshot) {
         if (!snapshot.success) {
             LOG_ERROR("NewsService", "Local article analysis failed: " + snapshot.error);
             cb(false, {});
             return;
         }
 
-        const NewsAnalysis analysis = build_local_analysis(snapshot);
-        cb(true, analysis);
-        emit this->analysis_ready(analysis);
+        if (!ai_chat::LlmService::instance().is_configured()) {
+            LOG_WARN("NewsService", "Article analysis requires Codex OAuth or another configured LLM provider");
+            cb(false, {});
+            return;
+        }
+
+        const QString prompt = build_article_analysis_prompt(snapshot, trimmed_url);
+        QPointer<NewsService> self = this;
+        auto future = QtConcurrent::run([self, cb, prompt]() {
+            const auto response = ai_chat::LlmService::instance().chat(prompt, {}, false);
+            NewsAnalysis analysis;
+            const bool ok = response.success && analysis_from_llm_json(response.content, analysis);
+            const QString error = response.error;
+
+            if (!self)
+                return;
+            QMetaObject::invokeMethod(
+                self,
+                [self, cb, ok, analysis, error]() {
+                    if (!self)
+                        return;
+                    if (!ok) {
+                        LOG_WARN("NewsService", "Codex article analysis failed: " + error.left(180));
+                        cb(false, {});
+                        return;
+                    }
+                    cb(true, analysis);
+                    emit self->analysis_ready(analysis);
+                },
+                Qt::QueuedConnection);
+        });
+        Q_UNUSED(future);
     };
 
     if (!python::PythonRunner::instance().is_available()) {
@@ -671,18 +710,23 @@ void NewsService::analyze_article(const QString& url, AnalysisCallback cb) {
         });
 }
 
-// ── Local Headline Summarization ─────────────────────────────────────────────
+// ── Codex Headline Summarization ────────────────────────────────────────────
 
 void NewsService::summarize_headlines(const QVector<NewsArticle>& articles, int count, SummaryCallback cb) {
+    if (articles.isEmpty()) {
+        cb(false, {});
+        return;
+    }
+
     // Build headline signature for cache check
     QStringList headlines;
     for (int i = 0; i < std::min(count, static_cast<int>(articles.size())); ++i)
         headlines.append(articles[i].headline);
     std::sort(headlines.begin(), headlines.end());
     QString sig = headlines.join("|").left(500);
+    const QString sum_key = "news:summary:" + sig.left(200);
 
     {
-        const QString sum_key = "news:summary:" + sig.left(200);
         const QVariant cached = fincept::CacheManager::instance().get(sum_key);
         if (!cached.isNull()) {
             cb(true, cached.toString());
@@ -690,13 +734,38 @@ void NewsService::summarize_headlines(const QVector<NewsArticle>& articles, int 
         }
     }
 
-    const QString summary = build_local_summary(articles, count);
-    if (!summary.isEmpty()) {
-        fincept::CacheManager::instance().put("news:summary:" + sig.left(200), QVariant(summary), kSummaryCacheTtlSec,
-                                              "news");
+    if (!ai_chat::LlmService::instance().is_configured()) {
+        LOG_WARN("NewsService", "Headline brief requires Codex OAuth or another configured LLM provider");
+        cb(false, {});
+        return;
     }
 
-    cb(!summary.isEmpty(), summary);
+    const QString prompt = build_headline_brief_prompt(articles, count);
+    QPointer<NewsService> self = this;
+    auto future = QtConcurrent::run([self, cb, prompt, sum_key]() {
+        const auto response = ai_chat::LlmService::instance().chat(prompt, {}, false);
+        const QString summary = clean_llm_text(response.content).left(1800);
+        const bool ok = response.success && !summary.isEmpty();
+        const QString error = response.error;
+
+        if (!self)
+            return;
+        QMetaObject::invokeMethod(
+            self,
+            [self, cb, ok, summary, sum_key, error]() {
+                if (!self)
+                    return;
+                if (!ok) {
+                    LOG_WARN("NewsService", "Codex headline brief failed: " + error.left(180));
+                    cb(false, {});
+                    return;
+                }
+                fincept::CacheManager::instance().put(sum_key, QVariant(summary), kSummaryCacheTtlSec, "news");
+                cb(true, summary);
+            },
+            Qt::QueuedConnection);
+    });
+    Q_UNUSED(future);
 }
 
 // ── WebSocket live feed ──────────────────────────────────────────────────────
@@ -751,10 +820,9 @@ void NewsService::connect_live_feed(const QString& ws_url) {
 
         enrich_article(article);
 
-        // Prepend to cached articles
         QVector<NewsArticle> updated;
         {
-            const QVariant cv = fincept::CacheManager::instance().get("news:articles");
+            const QVariant cv = fincept::CacheManager::instance().get(kNewsArticlesCacheKey);
             if (!cv.isNull()) {
                 const QJsonArray existing = QJsonDocument::fromJson(cv.toString().toUtf8()).array();
                 updated.reserve(existing.size() + 1);
@@ -771,31 +839,28 @@ void NewsService::connect_live_feed(const QString& ws_url) {
                     a.link = o["link"].toString();
                     a.sort_ts = o["sort_ts"].toVariant().toLongLong();
                     a.tier = o["tier"].toInt(4);
+                    a.priority = priority_from_string(o["priority"].toString());
+                    a.sentiment = sentiment_from_string(o["sentiment"].toString());
+                    a.impact = impact_from_string(o["impact"].toString());
+                    a.lang = o["lang"].toString();
+                    for (const auto& t : o["tickers"].toArray())
+                        a.tickers << t.toString();
                     updated.append(a);
                 }
             }
         }
         updated.prepend(article);
-        QJsonArray narr;
-        for (const auto& a : updated) {
-            QJsonObject o;
-            o["id"] = a.id;
-            o["time"] = a.time;
-            o["headline"] = a.headline;
-            o["summary"] = a.summary;
-            o["source"] = a.source;
-            o["region"] = a.region;
-            o["category"] = a.category;
-            o["link"] = a.link;
-            o["sort_ts"] = static_cast<qint64>(a.sort_ts);
-            o["tier"] = a.tier;
-            narr.append(o);
-        }
-        fincept::CacheManager::instance().put(
-            "news:articles", QVariant(QString::fromUtf8(QJsonDocument(narr).toJson(QJsonDocument::Compact))),
-            kArticleCacheTtlSec, "news");
-        emit articles_partial(updated, 1, 1);
-        LOG_INFO("NewsService", "Live article: " + article.headline.left(50));
+
+        QPointer<NewsService> self = this;
+        const QString headline = article.headline;
+        apply_finbert_sentiment(std::move(updated), [self, headline](QVector<NewsArticle> refined) {
+            if (!self)
+                return;
+            cache_news_articles(refined);
+            emit self->articles_partial(refined, 1, 1);
+            self->publish_articles_to_hub(refined);
+            LOG_INFO("NewsService", "Live article: " + headline.left(50));
+        });
     });
 
     QString url = ws_url.trimmed();

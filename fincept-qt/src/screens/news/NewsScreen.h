@@ -72,6 +72,7 @@ class NewsScreen : public QWidget, public IStatefulScreen {
 
     void refresh_data(bool force);
     void apply_filters_async();
+    void request_semantic_clusters(int generation, const QVector<services::NewsArticle>& filtered);
     void update_ui_from_filtered(int generation, const QVector<services::NewsArticle>& filtered,
                                  const QVector<services::NewsCluster>& clusters,
                                  const QMap<QString, int>& category_counts, int bullish, int bearish, int neutral);

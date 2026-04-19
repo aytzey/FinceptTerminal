@@ -493,16 +493,18 @@ QWidget* DocsScreen::page_markets() {
 
 QWidget* DocsScreen::page_news() {
     return make_page(
-        "NEWS", "Real-time news with clustering, sentiment analysis, and deviation monitoring",
+        "NEWS", "Real-time news with semantic clustering, Codex briefs, and deviation monitoring",
         {
             {"OVERVIEW", "The News screen aggregates financial news from multiple sources with intelligent "
-                         "clustering, sentiment analysis, and customizable keyword monitors that alert you "
-                         "to significant deviations from baseline coverage patterns."},
+                         "semantic clustering, Codex-powered market interpretation, and customizable keyword "
+                         "monitors that alert you to significant deviations from baseline coverage patterns."},
             {"KEY FEATURES", "■  Category filtering — All, Markets, Economy, Tech, Crypto, Geopolitics\n"
                              "■  Time range selection — 1H, 4H, 24H, 7D, 30D\n"
                              "■  Sort by recency, relevance, or sentiment score\n"
-                             "■  News clustering — related articles grouped together\n"
-                             "■  Sentiment analysis — bullish/bearish/neutral tagging\n"
+                             "■  Semantic clustering — sentence-transformer communities for related articles\n"
+                             "■  Codex AI brief — market interpretation from the current filtered feed\n"
+                             "■  Codex article analysis — structured risk, topic, and impact extraction\n"
+                             "■  FinBERT sentiment — CPU model tagging for bullish/bearish/neutral tone\n"
                              "■  Keyword monitors — set alerts for specific topics\n"
                              "■  Deviation detection — flags unusual coverage patterns\n"
                              "■  Full article reader with clean formatting"},

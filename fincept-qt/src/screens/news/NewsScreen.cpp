@@ -18,6 +18,9 @@
 
 #include <QDateTime>
 #include <QDesktopServices>
+#include <QHash>
+#include <QJsonArray>
+#include <QJsonObject>
 #include <QPointer>
 #include <QScrollBar>
 #include <QSettings>
@@ -30,6 +33,126 @@
 #include <cmath>
 
 namespace fincept::screens {
+
+namespace {
+
+constexpr int kSemanticClusterArticleLimit = 300;
+
+services::NewsCluster build_cluster_from_articles(const QVector<services::NewsArticle>& articles) {
+    services::NewsCluster cluster;
+    if (articles.isEmpty())
+        return cluster;
+
+    cluster.articles = articles;
+    cluster.lead_article = articles.first();
+    cluster.category = cluster.lead_article.category;
+    cluster.tier = cluster.lead_article.tier;
+    cluster.latest_sort_ts = cluster.lead_article.sort_ts;
+    cluster.velocity = "stable";
+
+    QSet<QString> sources;
+    int bullish = 0;
+    int bearish = 0;
+    int recent = 0;
+    int older = 0;
+    const int64_t now = QDateTime::currentSecsSinceEpoch();
+
+    QStringList ids;
+    ids.reserve(articles.size());
+    for (const auto& article : articles) {
+        ids.append(article.id);
+        sources.insert(article.source);
+        cluster.latest_sort_ts = std::max(cluster.latest_sort_ts, article.sort_ts);
+        cluster.tier = std::min(cluster.tier, article.tier);
+        if (article.priority == services::Priority::FLASH || article.priority == services::Priority::URGENT ||
+            article.priority == services::Priority::BREAKING)
+            cluster.is_breaking = true;
+        if (article.sentiment == services::Sentiment::BULLISH)
+            ++bullish;
+        else if (article.sentiment == services::Sentiment::BEARISH)
+            ++bearish;
+        if ((now - article.sort_ts) < 7200)
+            ++recent;
+        else
+            ++older;
+    }
+
+    cluster.source_count = sources.size();
+    cluster.sentiment = bullish > bearish   ? services::Sentiment::BULLISH
+                        : bearish > bullish ? services::Sentiment::BEARISH
+                                            : services::Sentiment::NEUTRAL;
+    cluster.velocity = recent > older ? "rising" : recent == older ? "stable" : "falling";
+
+    std::sort(cluster.articles.begin(), cluster.articles.end(),
+              [](const services::NewsArticle& a, const services::NewsArticle& b) {
+                  if (a.tier != b.tier)
+                      return a.tier < b.tier;
+                  return a.sort_ts > b.sort_ts;
+              });
+    cluster.lead_article = cluster.articles.first();
+    cluster.category = cluster.lead_article.category;
+
+    std::sort(ids.begin(), ids.end());
+    cluster.id = QString::number(qHash(ids.join('|')), 16);
+    return cluster;
+}
+
+QVector<services::NewsCluster> semantic_clusters_from_json(const QVector<services::NewsArticle>& articles,
+                                                           const QJsonArray& semantic_json) {
+    QHash<QString, services::NewsArticle> by_id;
+    by_id.reserve(articles.size());
+    for (const auto& article : articles)
+        by_id.insert(article.id, article);
+
+    QVector<services::NewsCluster> clusters;
+    QSet<QString> clustered_ids;
+
+    for (const auto& value : semantic_json) {
+        const auto obj = value.toObject();
+        const auto items = obj.value("items").toArray();
+        QVector<services::NewsArticle> members;
+        members.reserve(items.size());
+
+        const QString primary_id = obj.value("primary").toObject().value("id").toString();
+        if (!primary_id.isEmpty() && by_id.contains(primary_id) && !clustered_ids.contains(primary_id)) {
+            members.append(by_id.value(primary_id));
+            clustered_ids.insert(primary_id);
+        }
+
+        for (const auto& item_value : items) {
+            const QString id = item_value.toObject().value("id").toString();
+            if (id.isEmpty() || !by_id.contains(id) || clustered_ids.contains(id))
+                continue;
+            members.append(by_id.value(id));
+            clustered_ids.insert(id);
+        }
+
+        if (members.size() >= 2)
+            clusters.append(build_cluster_from_articles(members));
+    }
+
+    for (const auto& article : articles) {
+        if (clustered_ids.contains(article.id))
+            continue;
+        if (article.priority == services::Priority::FLASH || article.priority == services::Priority::URGENT ||
+            article.priority == services::Priority::BREAKING) {
+            QVector<services::NewsArticle> singleton;
+            singleton.append(article);
+            clusters.append(build_cluster_from_articles(singleton));
+        }
+    }
+
+    std::sort(clusters.begin(), clusters.end(), [](const services::NewsCluster& a, const services::NewsCluster& b) {
+        if (a.is_breaking != b.is_breaking)
+            return a.is_breaking;
+        if (a.articles.size() != b.articles.size())
+            return a.articles.size() > b.articles.size();
+        return a.latest_sort_ts > b.latest_sort_ts;
+    });
+    return clusters;
+}
+
+} // namespace
 
 NewsScreen::NewsScreen(QWidget* parent) : QWidget(parent) {
     setObjectName("newsScreen");
@@ -158,7 +281,7 @@ void NewsScreen::connect_signals() {
         const QSet<QString> ids = std::move(pending_seen_ids_);
         pending_seen_ids_.clear();
         QPointer<NewsScreen> self = this;
-        QtConcurrent::run([ids, self]() {
+        auto future = QtConcurrent::run([ids, self]() {
             for (const auto& id : ids)
                 fincept::NewsArticleRepository::instance().mark_seen(id);
             if (self) {
@@ -171,6 +294,7 @@ void NewsScreen::connect_signals() {
                     Qt::QueuedConnection);
             }
         });
+        Q_UNUSED(future);
     });
 
     // Scroll-based seen tracking
@@ -533,7 +657,7 @@ void NewsScreen::apply_filters_async() {
     const QString search_lower = search_query_.toLower();
     const QString sort = sort_mode_;
     const QString variant = active_variant_;
-    int visible_count = visible_article_count_;
+    const bool semantic_enabled = !loading_;
 
     // For 7D / 30D ranges, merge DB history
     if (time_range == "7D" || time_range == "30D") {
@@ -562,8 +686,8 @@ void NewsScreen::apply_filters_async() {
         }
     }
 
-    QtConcurrent::run([self, gen, articles_copy = std::move(articles_copy), category, time_range, search_lower, sort,
-                       variant, visible_count]() {
+    auto future = QtConcurrent::run([self, gen, articles_copy = std::move(articles_copy), category, time_range,
+                                     search_lower, sort, variant, semantic_enabled]() {
         int64_t window_sec = 0;
         if (time_range == "1H")
             window_sec = 3600;
@@ -654,11 +778,11 @@ void NewsScreen::apply_filters_async() {
             });
         }
 
-        auto clusters = services::cluster_articles(filtered);
+        QVector<services::NewsCluster> clusters;
 
         QMetaObject::invokeMethod(
             self,
-            [self, gen, filtered, clusters, category_counts, bullish, bearish, neutral]() {
+            [self, gen, filtered, clusters, category_counts, bullish, bearish, neutral, semantic_enabled]() {
                 if (!self)
                     return;
                 if (gen < self->filter_generation_.load(std::memory_order_relaxed)) {
@@ -666,9 +790,50 @@ void NewsScreen::apply_filters_async() {
                     return;
                 }
                 self->update_ui_from_filtered(gen, filtered, clusters, category_counts, bullish, bearish, neutral);
+                if (semantic_enabled)
+                    self->request_semantic_clusters(gen, filtered);
             },
             Qt::QueuedConnection);
     });
+    Q_UNUSED(future);
+}
+
+void NewsScreen::request_semantic_clusters(int generation, const QVector<services::NewsArticle>& filtered) {
+    if (filtered.size() < 2)
+        return;
+
+    QVector<services::NewsArticle> articles_for_model = filtered.mid(0, kSemanticClusterArticleLimit);
+    QPointer<NewsScreen> self = this;
+
+    services::NewsNlpService::instance().cluster_semantic(
+        articles_for_model, [self, generation, articles_for_model](bool ok, QJsonArray clusters_json) {
+            if (!self || !ok)
+                return;
+
+            const auto clusters = semantic_clusters_from_json(articles_for_model, clusters_json);
+            QMetaObject::invokeMethod(
+                self,
+                [self, generation, clusters]() {
+                    if (!self)
+                        return;
+                    if (generation < self->filter_generation_.load(std::memory_order_relaxed)) {
+                        LOG_INFO("NewsScreen", QString("Rejected stale semantic cluster gen %1").arg(generation));
+                        return;
+                    }
+
+                    self->clusters_ = clusters;
+                    self->feed_panel_->model()->set_clusters(clusters);
+                    self->command_bar_->update_stats(services::NewsService::instance().feed_count(),
+                                                     self->filtered_articles_.size(), clusters.size(),
+                                                     services::NewsService::instance().active_sources().size());
+                    self->command_bar_->set_alert_count(static_cast<int>(services::get_breaking_clusters(clusters).size()));
+
+                    const auto breaking = services::get_breaking_clusters(clusters);
+                    if (!breaking.isEmpty())
+                        self->feed_panel_->show_breaking(breaking);
+                },
+                Qt::QueuedConnection);
+        });
 }
 
 void NewsScreen::update_ui_from_filtered(int /*generation*/, const QVector<services::NewsArticle>& filtered,
