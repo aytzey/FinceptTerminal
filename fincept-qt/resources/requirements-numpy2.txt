@@ -23,6 +23,7 @@ databento-dbn==0.44.0
 feedparser==6.0.12
 gnews==0.4.2
 geopy>=2.4.0
+pycountry>=24.6.1
 akshare>=1.14.0
 aiohappyeyeballs==2.6.1
 aiosignal==1.4.0
@@ -80,6 +81,8 @@ wikipedia>=1.4.0
 torch==2.2.2; platform_machine == "x86_64" and sys_platform == "darwin"
 torch>=2.3.1; platform_machine != "x86_64" or sys_platform != "darwin"
 torchvision>=0.17.0
+sentence-transformers>=3.0.1,<4.0.0
+gliner>=0.2.14,<0.3.0
 scikit-learn>=1.4.2,<1.7.0
 scipy>=1.13.0,<1.17.0
 lightgbm>=4.6.0,<5.0.0

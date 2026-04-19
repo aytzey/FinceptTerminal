@@ -1,6 +1,7 @@
 // src/services/geopolitics/GeopoliticsService.h
 #pragma once
 #include "services/geopolitics/GeopoliticsTypes.h"
+#include "services/news/NewsService.h"
 
 #include <QHash>
 #include <QObject>
@@ -59,11 +60,17 @@ class GeopoliticsService : public QObject
     void error_occurred(QString context, QString message);
 
   private:
+    using ModelEventsCallback =
+        std::function<void(bool ok, QVector<fincept::services::geo::NewsEvent> events, int total, QString error)>;
+
     explicit GeopoliticsService(QObject* parent = nullptr);
     Q_DISABLE_COPY(GeopoliticsService)
 
     void run_python(const QString& script, const QStringList& args, const QString& context,
                     std::function<void(bool, const QString&)> cb);
+    void extract_model_events(const QVector<fincept::services::NewsArticle>& articles, const QString& country,
+                              const QString& city, const QString& category, int limit, ModelEventsCallback cb);
+    void load_reference_events(ModelEventsCallback cb);
 
     // Cache TTLs (used as CacheManager ttl_seconds)
     static constexpr int kEventsTtlSec = 120;
@@ -71,6 +78,8 @@ class GeopoliticsService : public QObject
 
     void publish_hdx_result(const QString& context, const QVector<fincept::services::geo::HDXDataset>& datasets);
     bool hub_registered_ = false;
+    QVector<fincept::services::geo::NewsEvent> reference_events_cache_;
+    bool reference_events_cache_ready_ = false;
 };
 
 } // namespace fincept::services::geo

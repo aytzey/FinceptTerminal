@@ -1,19 +1,36 @@
 """
-News NLP Pipeline — Entity extraction, semantic clustering, batch sentiment.
-Called by NewsNlpService via PythonRunner.
+News NLP Pipeline.
 
-Commands:
-  extract_entities <json_headlines>
-  cluster_semantic <json_headlines>
-  analyze_sentiment_batch <json_headlines>
+Core extraction paths are model-based:
+  - GLiNER for entities
+  - sentence-transformers for semantic clustering
+  - sentence-transformers for geopolitics event labeling
 """
 import sys
 import json
 import re
-import math
 from collections import Counter
+from functools import lru_cache
+from pathlib import Path
 
-# ── Country/Region database ──────────────────────────────────────────────────
+
+GLINER_MODEL_NAME = "urchade/gliner_medium-v2.1"
+EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+ENTITY_LABELS = ["person", "organization", "company", "country", "city", "region", "location"]
+GEO_ENTITY_LABELS = ["country", "city", "region", "location"]
+EVENT_LABEL_TEXTS = {
+    "armed_conflict": "military conflict, invasion, missile strike, airstrike, troop movement, armed confrontation",
+    "terrorism": "terrorist attack, bombing, insurgent violence, militant operation, extremist attack",
+    "protests": "public protest, street demonstration, civil unrest, labor strike, political rally",
+    "riots": "riot, violent clashes, looting, mob violence, chaotic street unrest",
+    "explosions": "major explosion, blast, sabotage detonation, industrial blast, unexplained explosion",
+    "strategic": "sanctions, diplomacy, ceasefire, summit, election, referendum, blockade, embargo, tariff dispute",
+    "crisis": "humanitarian crisis, geopolitical standoff, escalating tensions, state emergency, political crisis",
+}
+GEOCODE_CACHE_PATH = Path.home() / ".cache" / "fincept" / "news_geocode_cache.json"
+GEOCODE_USER_AGENT = "FinceptTerminal/4.0"
+
+# ── Country/Region normalization ─────────────────────────────────────────────
 
 COUNTRIES = {
     "united states": "US", "usa": "US", "u.s.": "US", "america": "US",
@@ -72,62 +89,163 @@ COUNTRIES = {
     "european union": "EU", "eu": "EU", "brussels": "EU",
 }
 
-# ── Organization patterns ────────────────────────────────────────────────────
+@lru_cache(maxsize=1)
+def get_gliner_model():
+    from gliner import GLiNER
 
-ORGANIZATIONS = {
-    "nato": "NATO", "united nations": "UN", "un": "UN",
-    "imf": "IMF", "world bank": "World Bank",
-    "federal reserve": "Federal Reserve", "the fed": "Federal Reserve",
-    "ecb": "ECB", "european central bank": "ECB",
-    "bank of england": "Bank of England", "boe": "Bank of England",
-    "bank of japan": "Bank of Japan", "boj": "Bank of Japan",
-    "peoples bank of china": "PBOC", "pboc": "PBOC",
-    "sec": "SEC", "securities and exchange": "SEC",
-    "opec": "OPEC", "opec+": "OPEC+",
-    "world health organization": "WHO", "who": "WHO",
-    "world trade organization": "WTO", "wto": "WTO",
-    "pentagon": "Pentagon", "white house": "White House",
-    "congress": "US Congress", "senate": "US Senate",
-    "european commission": "European Commission",
-    "iaea": "IAEA", "g7": "G7", "g20": "G20", "brics": "BRICS",
-    "reuters": "Reuters", "bloomberg": "Bloomberg",
-    "apple": "Apple", "google": "Google", "alphabet": "Alphabet",
-    "microsoft": "Microsoft", "amazon": "Amazon", "meta": "Meta",
-    "nvidia": "NVIDIA", "tesla": "Tesla", "openai": "OpenAI",
-    "goldman sachs": "Goldman Sachs", "jpmorgan": "JPMorgan",
-    "blackrock": "BlackRock", "berkshire hathaway": "Berkshire Hathaway",
-    "hsbc": "HSBC", "ubs": "UBS", "credit suisse": "Credit Suisse",
-    "deutsche bank": "Deutsche Bank", "barclays": "Barclays",
-    "citigroup": "Citigroup", "morgan stanley": "Morgan Stanley",
-}
+    return GLiNER.from_pretrained(GLINER_MODEL_NAME)
 
-# ── Person title patterns ────────────────────────────────────────────────────
 
-PERSON_TITLES = [
-    r"\b(president|prime minister|chancellor|king|queen|prince|princess)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)",
-    r"\b(ceo|cfo|chairman|director|minister|secretary|governor|general)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)",
-    r"\b(mr|mrs|ms|dr|prof)\.\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)",
-]
+@lru_cache(maxsize=1)
+def get_embed_model():
+    from sentence_transformers import SentenceTransformer
 
-# Known leaders
-KNOWN_PERSONS = {
-    "biden": "Joe Biden", "trump": "Donald Trump", "obama": "Barack Obama",
-    "putin": "Vladimir Putin", "xi jinping": "Xi Jinping", "xi": "Xi Jinping",
-    "modi": "Narendra Modi", "macron": "Emmanuel Macron",
-    "scholz": "Olaf Scholz", "sunak": "Rishi Sunak", "starmer": "Keir Starmer",
-    "kishida": "Fumio Kishida", "trudeau": "Justin Trudeau",
-    "zelensky": "Volodymyr Zelensky", "zelenskyy": "Volodymyr Zelensky",
-    "netanyahu": "Benjamin Netanyahu",
-    "erdogan": "Recep Tayyip Erdogan",
-    "musk": "Elon Musk", "bezos": "Jeff Bezos", "zuckerberg": "Mark Zuckerberg",
-    "cook": "Tim Cook", "nadella": "Satya Nadella", "altman": "Sam Altman",
-    "dimon": "Jamie Dimon", "powell": "Jerome Powell", "lagarde": "Christine Lagarde",
-    "yellen": "Janet Yellen",
-}
+    return SentenceTransformer(EMBED_MODEL_NAME, device="cpu")
+
+
+@lru_cache(maxsize=1)
+def get_event_label_matrix():
+    model = get_embed_model()
+    labels = list(EVENT_LABEL_TEXTS.keys())
+    descriptions = [EVENT_LABEL_TEXTS[label] for label in labels]
+    embeddings = model.encode(descriptions, normalize_embeddings=True)
+    return labels, embeddings
+
+
+@lru_cache(maxsize=1)
+def get_geocode_cache():
+    try:
+        if GEOCODE_CACHE_PATH.exists():
+            return json.loads(GEOCODE_CACHE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+@lru_cache(maxsize=1)
+def get_geocoder():
+    from geopy.extra.rate_limiter import RateLimiter
+    from geopy.geocoders import Nominatim
+
+    geolocator = Nominatim(user_agent=GEOCODE_USER_AGENT, timeout=10)
+    return RateLimiter(geolocator.geocode, min_delay_seconds=1.0)
+
+
+def persist_geocode_cache():
+    try:
+        GEOCODE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        GEOCODE_CACHE_PATH.write_text(json.dumps(get_geocode_cache()), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def country_to_code(name):
+    try:
+        import pycountry
+
+        return pycountry.countries.lookup(name).alpha_2
+    except Exception:
+        return COUNTRIES.get(name.lower())
+
+
+def normalize_place_key(text):
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def geocode_place(name, kind="", country_hint=""):
+    query = (name or "").strip()
+    if not query:
+        return None
+
+    cache_key = "|".join(
+        [
+            kind or "",
+            normalize_place_key(query),
+            normalize_place_key(country_hint),
+        ]
+    )
+    cache = get_geocode_cache()
+    if cache_key in cache:
+        return cache[cache_key]
+
+    geocode = get_geocoder()
+    query_text = query if not country_hint or kind == "country" else f"{query}, {country_hint}"
+    country_codes = None
+    if country_hint:
+        code = country_to_code(country_hint)
+        if code:
+            country_codes = code.lower()
+
+    location = None
+    try:
+        location = geocode(query_text, exactly_one=True, addressdetails=True, country_codes=country_codes)
+    except TypeError:
+        location = geocode(query_text, exactly_one=True, addressdetails=True)
+    except Exception:
+        location = None
+
+    if location is None and query_text != query:
+        try:
+            location = geocode(query, exactly_one=True, addressdetails=True)
+        except Exception:
+            location = None
+
+    if location is None:
+        cache[cache_key] = None
+        persist_geocode_cache()
+        return None
+
+    raw = getattr(location, "raw", {}) or {}
+    address = raw.get("address", {})
+    result = {
+        "name": query,
+        "lat": float(location.latitude),
+        "lon": float(location.longitude),
+        "country": address.get("country", ""),
+        "city": address.get("city")
+        or address.get("town")
+        or address.get("village")
+        or address.get("municipality")
+        or address.get("state")
+        or "",
+    }
+    cache[cache_key] = result
+    persist_geocode_cache()
+    return result
+
+
+def predict_entities(text, labels, threshold=0.4):
+    model = get_gliner_model()
+    entities = model.predict_entities(text, labels, threshold=threshold)
+    entities.sort(key=lambda item: item.get("score", 0.0), reverse=True)
+    return entities
+
+
+def semantic_event_category(text):
+    model = get_embed_model()
+    labels, label_embeddings = get_event_label_matrix()
+    query_embedding = model.encode([text], normalize_embeddings=True)[0]
+    scores = (label_embeddings @ query_embedding).tolist()
+    best_idx = max(range(len(scores)), key=lambda idx: scores[idx])
+    return labels[best_idx], float(scores[best_idx])
+
+
+def best_geographic_signal(text):
+    entities = predict_entities(text, GEO_ENTITY_LABELS, threshold=0.35)
+    by_label = {"city": [], "country": [], "region": [], "location": []}
+    for entity in entities:
+        label = entity.get("label", "").lower()
+        if label in by_label:
+            by_label[label].append(entity.get("text", "").strip())
+
+    for label in ("city", "country", "region", "location"):
+        if by_label[label]:
+            return by_label[label][0], label, entities
+    return "", "", entities
 
 
 def extract_entities(headlines_json):
-    """Extract countries, organizations, people, and tickers from headlines."""
+    """Extract countries, organizations, people, and tickers with GLiNER."""
     try:
         articles = json.loads(headlines_json) if isinstance(headlines_json, str) else headlines_json
     except json.JSONDecodeError:
@@ -142,54 +260,37 @@ def extract_entities(headlines_json):
     for article in articles:
         headline = article.get("headline", "")
         summary = article.get("summary", "")
-        text = (headline + " " + summary).lower()
-        text_orig = headline + " " + summary
+        text = (headline + " " + summary).strip()
 
         countries = []
         orgs = []
         people = []
         tickers = []
 
-        # Country extraction — use word-boundary matching to avoid substring hits
-        # (e.g. "rome" inside "jerome", "uk" inside "truck", "thai" inside "thailand")
-        for pattern, code in COUNTRIES.items():
-            if len(pattern) <= 4 or " " not in pattern:
-                # Short or single-word patterns: require word boundaries
-                if re.search(r'\b' + re.escape(pattern) + r'\b', text):
-                    countries.append({"name": pattern.title(), "code": code})
-                    all_countries[code] += 1
-            else:
-                # Multi-word patterns: simple substring is fine
-                if pattern in text:
-                    countries.append({"name": pattern.title(), "code": code})
-                    all_countries[code] += 1
-
-        # Organization extraction
-        for pattern, name in ORGANIZATIONS.items():
-            if pattern in text:
-                orgs.append(name)
-                all_orgs[name] += 1
-
-        # Person extraction — known persons
-        for pattern, name in KNOWN_PERSONS.items():
-            if pattern in text:
+        entities = predict_entities(text, ENTITY_LABELS, threshold=0.4)
+        for entity in entities:
+            label = entity.get("label", "").lower()
+            name = entity.get("text", "").strip()
+            if not name:
+                continue
+            if label == "person":
                 people.append(name)
                 all_people[name] += 1
-
-        # Person extraction — title patterns
-        for pat in PERSON_TITLES:
-            for match in re.finditer(pat, text_orig):
-                name = match.group(2).strip()
-                if len(name) > 3 and name not in people:
-                    people.append(name)
-                    all_people[name] += 1
+            elif label in {"organization", "company"}:
+                orgs.append(name)
+                all_orgs[name] += 1
+            elif label == "country":
+                code = country_to_code(name)
+                countries.append({"name": name, "code": code or ""})
+                if code:
+                    all_countries[code] += 1
 
         # Ticker extraction (uppercase 2-5 chars, filter common words)
         common = {"THE", "FOR", "AND", "BUT", "NOT", "FROM", "WITH", "THIS", "THAT",
                   "HAVE", "WILL", "BEEN", "THEY", "WERE", "SAID", "HAS", "ITS", "NEW",
                   "ARE", "WAS", "WHO", "HOW", "WHY", "ALL", "CAN", "MAY", "NOW", "SEC",
                   "GDP", "CEO", "CFO", "IPO", "ETF", "GDP", "CPI", "PMI"}
-        for m in re.finditer(r'\b[A-Z]{2,5}\b', text_orig):
+        for m in re.finditer(r'\b[A-Z]{2,5}\b', text):
             t = m.group()
             if t not in common:
                 tickers.append(t)
@@ -220,7 +321,7 @@ def extract_entities(headlines_json):
 
 
 def cluster_semantic(headlines_json):
-    """Cluster headlines by TF-IDF cosine similarity."""
+    """Cluster semantically with sentence-transformers community detection."""
     try:
         articles = json.loads(headlines_json) if isinstance(headlines_json, str) else headlines_json
     except json.JSONDecodeError:
@@ -229,104 +330,15 @@ def cluster_semantic(headlines_json):
     if len(articles) < 2:
         return {"success": True, "clusters": [], "method": "too_few_articles"}
 
-    # Tokenize and build TF-IDF manually (no sklearn dependency required)
-    # Synonym map: normalize common abbreviations/variants to a canonical form
-    SYNONYMS = {
-        "fed": "federal_reserve", "federal": "federal_reserve", "reserve": "federal_reserve",
-        "ecb": "european_central_bank",
-        "boj": "bank_of_japan",
-        "boe": "bank_of_england",
-        "pboc": "peoples_bank_china",
-        "nato": "nato_alliance",
-        "gop": "republican",
-        "kyiv": "ukraine_capital", "kiev": "ukraine_capital",
-        "sanctioned": "sanction", "sanctions": "sanction",
-        "rates": "interest_rate", "rate": "interest_rate",
-        "inflation": "inflation_cpi",
-        "troops": "military_troops", "soldiers": "military_troops",
-        "missiles": "missile", "strikes": "strike", "attacked": "attack", "attacks": "attack",
-        "crashed": "crash", "crashes": "crash",
-        "rallied": "rally", "rallies": "rally",
-    }
+    from sentence_transformers import util
 
-    def tokenize(text):
-        words = re.findall(r'[a-z]{3,}', text.lower())
-        stop = {"the", "and", "for", "are", "but", "not", "you", "all", "can",
-                "had", "her", "was", "one", "our", "out", "has", "its", "his",
-                "how", "who", "oil", "new", "now", "old", "see", "way", "may",
-                "day", "too", "any", "been", "have", "from", "with", "they",
-                "will", "each", "make", "like", "been", "than", "them", "then",
-                "what", "when", "that", "this", "said", "over", "into", "also",
-                "more", "some", "very", "after", "about", "which", "their", "there"}
-        return [SYNONYMS.get(w, w) for w in words if w not in stop]
-
-    docs = []
-    for a in articles:
-        tokens = tokenize(a.get("headline", "") + " " + a.get("summary", ""))
-        docs.append(tokens)
-
-    # Build vocabulary
-    vocab = {}
-    df = Counter()
-    for doc in docs:
-        seen = set()
-        for w in doc:
-            if w not in vocab:
-                vocab[w] = len(vocab)
-            if w not in seen:
-                df[w] += 1
-                seen.add(w)
-
-    n_docs = len(docs)
-    if not vocab:
-        return {"success": True, "clusters": [], "method": "empty_vocab"}
-
-    # TF-IDF vectors
-    def tfidf_vec(tokens):
-        tf = Counter(tokens)
-        vec = {}
-        for w, count in tf.items():
-            if w in vocab:
-                idf = math.log((n_docs + 1) / (df.get(w, 0) + 1)) + 1
-                vec[vocab[w]] = (count / max(len(tokens), 1)) * idf
-        return vec
-
-    vectors = [tfidf_vec(doc) for doc in docs]
-
-    # Cosine similarity
-    def cosine(a, b):
-        keys = set(a.keys()) & set(b.keys())
-        if not keys:
-            return 0.0
-        dot = sum(a[k] * b[k] for k in keys)
-        norm_a = math.sqrt(sum(v * v for v in a.values()))
-        norm_b = math.sqrt(sum(v * v for v in b.values()))
-        if norm_a == 0 or norm_b == 0:
-            return 0.0
-        return dot / (norm_a * norm_b)
-
-    # Single-pass clustering (threshold = 0.25 — catches more topically related articles)
-    THRESHOLD = 0.25
-    clusters = []
-    assigned = set()
-
-    for i in range(len(vectors)):
-        if i in assigned:
-            continue
-        cluster = [i]
-        assigned.add(i)
-        for j in range(i + 1, len(vectors)):
-            if j in assigned:
-                continue
-            if cosine(vectors[i], vectors[j]) >= THRESHOLD:
-                cluster.append(j)
-                assigned.add(j)
-        clusters.append(cluster)
+    texts = [(a.get("headline", "") + ". " + a.get("summary", "")).strip() for a in articles]
+    model = get_embed_model()
+    embeddings = model.encode(texts, normalize_embeddings=True)
+    communities = util.community_detection(embeddings, min_community_size=2, threshold=0.72)
 
     result_clusters = []
-    for indices in clusters:
-        if len(indices) < 2:
-            continue
+    for indices in communities:
         items = [{"id": articles[i].get("id", ""), "headline": articles[i].get("headline", "")} for i in indices]
         result_clusters.append({
             "primary": items[0],
@@ -339,9 +351,125 @@ def cluster_semantic(headlines_json):
     return {
         "success": True,
         "clusters": result_clusters[:20],
-        "method": "tfidf_cosine",
+        "method": "sentence_transformers_community_detection",
         "total_articles": len(articles),
         "clustered_count": sum(c["size"] for c in result_clusters),
+    }
+
+
+def extract_geopolitics_events(headlines_json, country_filter="", city_filter="", category_filter="", limit=50):
+    try:
+        articles = json.loads(headlines_json) if isinstance(headlines_json, str) else headlines_json
+    except json.JSONDecodeError:
+        return {"success": False, "error": "Invalid JSON"}
+
+    limit = max(1, min(int(limit), 250))
+    country_filter = country_filter.strip().lower()
+    city_filter = city_filter.strip().lower()
+    category_filter = category_filter.strip().lower()
+
+    events = []
+    for article in articles:
+        source_category = (article.get("category") or "").upper()
+        if source_category not in {"GEOPOLITICS", "DEFENSE", "REGULATORY", "ECONOMIC"}:
+            continue
+
+        headline = (article.get("headline") or "").strip()
+        summary = (article.get("summary") or "").strip()
+        text = (headline + ". " + summary).strip()
+        if not text:
+            continue
+
+        event_category, score = semantic_event_category(text)
+        if score < 0.20:
+            continue
+
+        _, _, geo_entities = best_geographic_signal(text)
+        geo_terms = []
+        countries = []
+        cities = []
+        for entity in geo_entities:
+            entity_text = entity.get("text", "").strip()
+            label = entity.get("label", "").lower()
+            if not entity_text:
+                continue
+            if entity_text not in geo_terms:
+                geo_terms.append(entity_text)
+            if label == "country" and entity_text not in countries:
+                countries.append(entity_text)
+            elif label in {"city", "region", "location"} and entity_text not in cities:
+                cities.append(entity_text)
+
+        if not countries and not cities:
+            continue
+
+        country = countries[0] if countries else ""
+        city = cities[0] if cities else ""
+        geocoded = None
+        if city:
+            geocoded = geocode_place(city, kind="city", country_hint=country)
+        elif country:
+            geocoded = geocode_place(country, kind="country")
+
+        latitude = None
+        longitude = None
+        if geocoded:
+            latitude = geocoded.get("lat")
+            longitude = geocoded.get("lon")
+            if not country:
+                country = geocoded.get("country") or country
+            if not city:
+                city = geocoded.get("city") or city
+
+        country = (country or "").strip()
+        city = (city or "").strip()
+        if country_filter and country_filter not in country.lower():
+            continue
+        if city_filter and city_filter not in city.lower():
+            continue
+        if category_filter and category_filter != event_category.lower():
+            continue
+
+        events.append(
+            {
+                "url": article.get("link", ""),
+                "domain": article.get("source", ""),
+                "event_category": event_category,
+                "matched_keywords": headline[:180],
+                "city": city,
+                "country": country,
+                "latitude": latitude,
+                "longitude": longitude,
+                "extracted_date": "",
+                "created_at": article.get("sort_ts", 0),
+                "context": {
+                    "similarity": round(score, 4),
+                    "geo_terms": geo_terms,
+                },
+            }
+        )
+
+    events.sort(key=lambda item: item.get("created_at", 0), reverse=True)
+    trimmed = events[:limit]
+    for event in trimmed:
+        ts = int(event.get("created_at") or 0)
+        if ts > 0:
+            from datetime import datetime, timezone
+
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            event["extracted_date"] = dt.date().isoformat()
+            event["created_at"] = dt.isoformat()
+        else:
+            event["created_at"] = ""
+
+    return {
+        "success": True,
+        "events": trimmed,
+        "total": len(trimmed),
+        "method": {
+            "entities": "GLiNER",
+            "categories": "sentence-transformers semantic labeling",
+        },
     }
 
 
@@ -451,6 +579,12 @@ def main(args=None):
         result = extract_entities(data)
     elif command == "cluster_semantic":
         result = cluster_semantic(data)
+    elif command == "extract_geopolitics_events":
+        country = args[2] if len(args) > 2 else ""
+        city = args[3] if len(args) > 3 else ""
+        category = args[4] if len(args) > 4 else ""
+        limit = args[5] if len(args) > 5 else "50"
+        result = extract_geopolitics_events(data, country, city, category, limit)
     elif command == "analyze_sentiment_batch":
         result = analyze_sentiment_batch(data)
     else:

@@ -75,7 +75,7 @@ class NewsNlpService : public QObject {
     /// Extract entities (countries, orgs, people, tickers) from articles.
     void extract_entities(const QVector<NewsArticle>& articles, EntitiesCallback cb);
 
-    /// Semantic clustering via TF-IDF cosine similarity.
+    /// Semantic clustering via sentence-transformers embeddings.
     void cluster_semantic(const QVector<NewsArticle>& articles, SemanticClustersCallback cb);
 
     /// Geolocate articles — extract locations and return coordinates.
