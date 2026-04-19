@@ -1048,17 +1048,16 @@ QWidget* DocsScreen::page_gov_data() {
 
 QWidget* DocsScreen::page_geopolitics() {
     return make_page(
-        "GEOPOLITICS", "Conflict monitoring, HDX data, trade analysis, and relationship mapping",
+        "GEOPOLITICS", "Conflict monitoring, HDX data, trade analysis, and local relationship mapping",
         {
             {"OVERVIEW", "The Geopolitics screen provides a comprehensive view of global geopolitical events "
-                         "with local news/model event extraction, a persistent event archive, humanitarian data (HDX), trade flow analysis, and entity "
-                         "relationship mapping for understanding geopolitical dynamics."},
+                         "with local news/model event extraction, a persistent event archive, humanitarian data (HDX), trade flow analysis, and "
+                         "event relationship mapping for understanding geopolitical dynamics."},
             {"KEY FEATURES", "■  Conflict monitor — Active global conflicts with severity tracking\n"
                              "■  Local event archive — Deduplicated geopolitics events retained in cache.db\n"
                              "■  HDX integration — Humanitarian Data Exchange for crisis data\n"
                              "■  Trade analysis — Sanctions, tariffs, trade flow disruptions\n"
-                             "■  Relationship mapping — Entity relationships and influence networks\n"
-                             "■  Risk scoring — Country-level geopolitical risk assessments\n"
+                             "■  Relationship mapping — Local country, event category, and source network\n"
                              "■  AI agent — Geopolitics-specialized analysis agent"},
             {"REAL-WORLD USAGE", "■  Risk management: Monitor geopolitical risks to your portfolio\n"
                                  "■  Commodity trading: Track supply disruptions from conflicts\n"
