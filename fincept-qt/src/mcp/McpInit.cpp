@@ -11,6 +11,7 @@
 #include "mcp/tools/DataHubTools.h"
 #include "mcp/tools/DataSourcesTools.h"
 #include "mcp/tools/EdgarTools.h"
+#include "mcp/tools/FinceptFinanceTools.h"
 #include "mcp/tools/FileManagerTools.h"
 #include "mcp/tools/ForumTools.h"
 #include "mcp/tools/MAAnalyticsTools.h"
@@ -41,6 +42,9 @@ void initialize_all_tools() {
 
     // markets tab (quotes, symbol search)
     provider.register_tools(tools::get_markets_tools());
+
+    // direct local finance/search/macro/research tools
+    provider.register_tools(tools::get_fincept_finance_tools());
 
     // watchlist tab
     provider.register_tools(tools::get_watchlist_tools());

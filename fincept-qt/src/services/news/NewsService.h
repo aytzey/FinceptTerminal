@@ -142,7 +142,7 @@ class NewsService : public QObject
     void fetch_all_news(bool force, ArticlesCallback cb);
     void analyze_article(const QString& url, AnalysisCallback cb);
 
-    /// Summarize top N headlines via AI. Cached for 10 min per headline signature.
+    /// Summarize top N headlines locally. Cached for 10 min per headline signature.
     void summarize_headlines(const QVector<NewsArticle>& articles, int count, SummaryCallback cb);
 
     int feed_count() const { return feed_count_; }
@@ -155,7 +155,7 @@ class NewsService : public QObject
     void fetch_all_news_progressive(bool force, ArticlesCallback final_cb);
 
     /// Connect to a WebSocket endpoint for live breaking news push.
-    /// If url is empty, uses default. Emits articles_partial on new data.
+    /// If url is empty, live push stays disabled. Emits articles_partial on new data.
     void connect_live_feed(const QString& ws_url = {});
     void disconnect_live_feed();
     bool is_live_connected() const;

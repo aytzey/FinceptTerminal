@@ -1,10 +1,12 @@
 #include "screens/dashboard/widgets/EconomicCalendarWidget.h"
 
-#include "network/http/HttpClient.h"
+#include "python/PythonRunner.h"
 #include "ui/theme/Theme.h"
 
+#include <QDate>
 #include <QFrame>
 #include <QHBoxLayout>
+#include <QJsonDocument>
 #include <QJsonObject>
 
 namespace fincept::screens::widgets {
@@ -88,34 +90,35 @@ void EconomicCalendarWidget::on_theme_changed() {
 void EconomicCalendarWidget::refresh_data() {
     set_loading(true);
 
-    // Response shape: {"success":true,"data":{"events":[...],"total_count":N,...}}
-    QString url = "https://api.fincept.in/macro/upcoming-events?limit=25";
-
-    fincept::HttpClient::instance().get(url, [this](fincept::Result<QJsonDocument> result) {
+    const QDate start = QDate::currentDate();
+    const QDate end = start.addDays(7);
+    fincept::python::PythonRunner::instance().run(
+        "investing_calendar_data.py",
+        {"economic", "", start.toString(Qt::ISODate), end.toString(Qt::ISODate)},
+        [this](fincept::python::PythonResult py_result) {
         set_loading(false);
-        if (!result.is_ok()) {
+        if (!py_result.success) {
             status_label_->setVisible(true);
             status_label_->setText("Failed to load calendar");
             return;
         }
 
-        auto doc = result.value();
+        auto doc = QJsonDocument::fromJson(fincept::python::extract_json(py_result.output).toUtf8());
         QJsonArray events;
 
         if (doc.isObject()) {
             auto root = doc.object();
-            // {"success":true,"data":{"events":[...]}}
             if (root.contains("data") && root["data"].isObject()) {
                 auto data = root["data"].toObject();
                 if (data.contains("events") && data["events"].isArray())
                     events = data["events"].toArray();
             }
-            // fallback: {"data":[...]}
             if (events.isEmpty() && root.contains("data") && root["data"].isArray())
                 events = root["data"].toArray();
-            // fallback: {"events":[...]}
             if (events.isEmpty() && root.contains("events") && root["events"].isArray())
                 events = root["events"].toArray();
+            if (events.isEmpty() && root.contains("result") && root["result"].isArray())
+                events = root["result"].toArray();
         } else if (doc.isArray()) {
             events = doc.array();
         }

@@ -1,7 +1,6 @@
 #include "services/news/NewsService.h"
 
 #include "core/logging/Logger.h"
-#include "network/http/HttpClient.h"
 #include "storage/cache/CacheManager.h"
 
 #    include "datahub/DataHub.h"
@@ -9,11 +8,15 @@
 
 #include <QAtomicInt>
 #include <QDateTime>
+#include <QEventLoop>
 #include <QJsonDocument>
+#include <QMap>
 #include <QMutex>
 #include <QMutexLocker>
+#include <QNetworkRequest>
 #include <QRegularExpression>
 #include <QSet>
+#include <QTimer>
 #include <QUuid>
 #include <QXmlStreamReader>
 
@@ -29,6 +32,243 @@ namespace fincept::services {
 static constexpr int kFeedTransferTimeoutMs = 5000;   // 5s per RSS feed request
 static constexpr int kWsReconnectDelayMs    = 10000;  // 10s before WebSocket reconnect
 static constexpr int kSummaryMaxChars       = 300;    // max chars for article summary
+
+namespace {
+
+struct ArticleSnapshot {
+    bool success = false;
+    QString title;
+    QString summary;
+    QString body;
+    QString error;
+};
+
+QString decode_html_entities(QString text) {
+    static const QMap<QString, QString> replacements = {
+        {"&amp;", "&"}, {"&lt;", "<"},   {"&gt;", ">"},   {"&quot;", "\""},
+        {"&#39;", "'"}, {"&nbsp;", " "}, {"&#8217;", "'"}, {"&#8211;", "-"},
+        {"&#8212;", "-"},
+    };
+    for (auto it = replacements.begin(); it != replacements.end(); ++it)
+        text.replace(it.key(), it.value(), Qt::CaseInsensitive);
+    return text;
+}
+
+QString extract_first_match(const QString& text, const QRegularExpression& re) {
+    const auto match = re.match(text);
+    if (!match.hasMatch())
+        return {};
+    return decode_html_entities(match.captured(1).trimmed()).simplified();
+}
+
+QString strip_html_blocks(QString html) {
+    static const QRegularExpression script_re("<script[^>]*>.*?</script>",
+                                              QRegularExpression::CaseInsensitiveOption
+                                                  | QRegularExpression::DotMatchesEverythingOption);
+    static const QRegularExpression style_re("<style[^>]*>.*?</style>",
+                                             QRegularExpression::CaseInsensitiveOption
+                                                 | QRegularExpression::DotMatchesEverythingOption);
+    static const QRegularExpression tag_re("<[^>]+>");
+    html.remove(script_re);
+    html.remove(style_re);
+    html.replace(tag_re, " ");
+    return decode_html_entities(html).simplified();
+}
+
+ArticleSnapshot fetch_article_snapshot(QNetworkAccessManager* nam, const QString& url) {
+    ArticleSnapshot snapshot;
+    if (!nam) {
+        snapshot.error = "Network manager unavailable";
+        return snapshot;
+    }
+
+    QNetworkRequest req{QUrl(url)};
+    req.setHeader(QNetworkRequest::UserAgentHeader, "FinceptTerminal/4.0");
+    req.setRawHeader("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+    req.setTransferTimeout(10000);
+
+    auto* reply = nam->get(req);
+    QEventLoop loop;
+    QTimer timer;
+    timer.setSingleShot(true);
+    QObject::connect(&timer, &QTimer::timeout, &loop, [&]() {
+        if (!reply->isFinished())
+            reply->abort();
+        loop.quit();
+    });
+    QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+    timer.start(10000);
+    loop.exec();
+    timer.stop();
+
+    if (reply->error() != QNetworkReply::NoError) {
+        snapshot.error = reply->errorString();
+        reply->deleteLater();
+        return snapshot;
+    }
+
+    const QString html = QString::fromUtf8(reply->readAll());
+    reply->deleteLater();
+
+    static const QRegularExpression og_title_re(
+        R"(<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["'])",
+        QRegularExpression::CaseInsensitiveOption);
+    static const QRegularExpression title_re(R"(<title[^>]*>(.*?)</title>)",
+                                             QRegularExpression::CaseInsensitiveOption
+                                                 | QRegularExpression::DotMatchesEverythingOption);
+    static const QRegularExpression og_desc_re(
+        R"(<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']+)["'])",
+        QRegularExpression::CaseInsensitiveOption);
+    static const QRegularExpression desc_re(
+        R"(<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["'])",
+        QRegularExpression::CaseInsensitiveOption);
+
+    snapshot.title = extract_first_match(html, og_title_re);
+    if (snapshot.title.isEmpty())
+        snapshot.title = extract_first_match(html, title_re);
+    snapshot.summary = extract_first_match(html, og_desc_re);
+    if (snapshot.summary.isEmpty())
+        snapshot.summary = extract_first_match(html, desc_re);
+    snapshot.body = strip_html_blocks(html);
+
+    if (snapshot.summary.isEmpty())
+        snapshot.summary = snapshot.body.left(kSummaryMaxChars);
+    if (snapshot.title.isEmpty())
+        snapshot.title = snapshot.summary.left(120);
+
+    snapshot.success = !snapshot.title.isEmpty() || !snapshot.summary.isEmpty() || !snapshot.body.isEmpty();
+    if (!snapshot.success)
+        snapshot.error = "Could not extract readable article text";
+    return snapshot;
+}
+
+QStringList top_terms(const QString& text, int limit = 8) {
+    static const QSet<QString> stop_words = {
+        "about", "after", "again", "against", "among", "also", "been", "before", "being", "between",
+        "could", "their", "there", "these", "those", "this", "that", "with", "from", "into", "because",
+        "while", "where", "which", "would", "should", "market", "markets", "company", "companies", "says",
+        "said", "report", "reports", "news", "latest", "today", "update", "will", "have", "has", "more",
+        "than", "over", "under", "into", "amid", "amidst", "year", "years", "quarter", "shares", "stock",
+        "global", "world", "business", "finance", "financial", "according", "statement",
+    };
+    static const QRegularExpression word_re(R"(\b[a-zA-Z][a-zA-Z-]{3,}\b)");
+
+    QMap<QString, int> counts;
+    auto it = word_re.globalMatch(text.toLower());
+    while (it.hasNext()) {
+        const QString token = it.next().captured().toLower();
+        if (stop_words.contains(token))
+            continue;
+        counts[token] += 1;
+    }
+
+    QList<QPair<QString, int>> ranked;
+    ranked.reserve(counts.size());
+    for (auto it2 = counts.begin(); it2 != counts.end(); ++it2)
+        ranked.append({it2.key(), it2.value()});
+    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+        if (a.second != b.second)
+            return a.second > b.second;
+        return a.first < b.first;
+    });
+
+    QStringList out;
+    for (const auto& item : ranked) {
+        out.append(item.first);
+        if (out.size() >= limit)
+            break;
+    }
+    return out;
+}
+
+RiskSignal classify_signal(const QString& text, const QStringList& high_keywords, const QStringList& medium_keywords,
+                           const QString& high_detail, const QString& medium_detail) {
+    for (const auto& keyword : high_keywords) {
+        if (text.contains(keyword))
+            return {"HIGH", high_detail};
+    }
+    for (const auto& keyword : medium_keywords) {
+        if (text.contains(keyword))
+            return {"MEDIUM", medium_detail};
+    }
+    return {"LOW", "No prominent local signal detected"};
+}
+
+QStringList derive_topics(const NewsArticle& article, const QString& text) {
+    QStringList topics;
+    if (!article.category.isEmpty())
+        topics << article.category.toLower();
+    if (text.contains("inflation") || text.contains("central bank") || text.contains("interest rate"))
+        topics << "macro";
+    if (text.contains("earnings") || text.contains("guidance") || text.contains("quarter"))
+        topics << "earnings";
+    if (text.contains("sanction") || text.contains("military") || text.contains("conflict"))
+        topics << "geopolitics";
+    if (text.contains("merger") || text.contains("acquisition"))
+        topics << "m&a";
+    if (text.contains("oil") || text.contains("gas") || text.contains("opec"))
+        topics << "energy";
+    topics.removeDuplicates();
+    return topics.mid(0, 6);
+}
+
+QString impact_prediction(const NewsArticle& article) {
+    if (article.sentiment == Sentiment::BEARISH && article.impact == Impact::HIGH)
+        return "negative";
+    if (article.sentiment == Sentiment::BULLISH && article.impact == Impact::HIGH)
+        return "positive";
+    if (article.sentiment == Sentiment::BULLISH)
+        return "moderate_positive";
+    if (article.sentiment == Sentiment::BEARISH)
+        return "moderate_negative";
+    return "neutral";
+}
+
+QString build_local_summary(const QVector<NewsArticle>& articles, int count) {
+    const int take = std::min(count, static_cast<int>(articles.size()));
+    if (take <= 0)
+        return {};
+
+    QMap<QString, int> categories;
+    int bullish = 0;
+    int bearish = 0;
+    int neutral = 0;
+    QStringList top_headlines;
+
+    for (int i = 0; i < take; ++i) {
+        const auto& article = articles[i];
+        categories[article.category.isEmpty() ? "OTHER" : article.category] += 1;
+        if (article.sentiment == Sentiment::BULLISH)
+            ++bullish;
+        else if (article.sentiment == Sentiment::BEARISH)
+            ++bearish;
+        else
+            ++neutral;
+        if (top_headlines.size() < 3)
+            top_headlines << article.headline;
+    }
+
+    QList<QPair<QString, int>> ranked_categories;
+    for (auto it = categories.begin(); it != categories.end(); ++it)
+        ranked_categories.append({it.key(), it.value()});
+    std::sort(ranked_categories.begin(), ranked_categories.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+
+    QStringList leading;
+    for (int i = 0; i < std::min(2, static_cast<int>(ranked_categories.size())); ++i)
+        leading << QString("%1 (%2)").arg(ranked_categories[i].first).arg(ranked_categories[i].second);
+
+    return QString("%1 headline scanned. Leading themes: %2. Tone: %3 bullish, %4 bearish, %5 neutral. "
+                   "Key items: %6.")
+        .arg(take)
+        .arg(leading.join(", "))
+        .arg(bullish)
+        .arg(bearish)
+        .arg(neutral)
+        .arg(top_headlines.join(" | "));
+}
+
+} // namespace
 
 // ── Singleton ───────────────────────────────────────────────────────────────
 
@@ -312,61 +552,79 @@ void NewsService::fetch_all_news_progressive(bool force, ArticlesCallback final_
     }
 }
 
-// ── AI Analysis via Fincept API ─────────────────────────────────────────────
+// ── Local Article Analysis ──────────────────────────────────────────────────
 
 void NewsService::analyze_article(const QString& url, AnalysisCallback cb) {
-    QJsonObject body;
-    body["url"] = url;
+    const auto snapshot = fetch_article_snapshot(nam_, url.trimmed());
+    if (!snapshot.success) {
+        LOG_ERROR("NewsService", "Local article analysis failed: " + snapshot.error);
+        cb(false, {});
+        return;
+    }
 
-    HttpClient::instance().post("/news/analyze", body, [this, cb](Result<QJsonDocument> result) {
-        if (result.is_err()) {
-            LOG_ERROR("NewsService", "Analysis failed: " + QString::fromStdString(result.error()));
-            cb(false, {});
-            return;
-        }
+    NewsArticle article;
+    article.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    article.link = url.trimmed();
+    article.headline = snapshot.title.left(200);
+    article.summary = snapshot.summary.left(kSummaryMaxChars);
+    article.source = QUrl(url).host().toUpper();
+    article.category = "MARKETS";
+    article.region = "GLOBAL";
+    article.time = QDateTime::currentDateTime().toString("MMM dd, HH:mm");
+    article.sort_ts = QDateTime::currentSecsSinceEpoch();
+    enrich_article(article);
 
-        auto obj = result.value().object();
-        if (!obj["success"].toBool(false)) {
-            LOG_ERROR("NewsService", "API returned failure: " + obj["message"].toString());
-            cb(false, {});
-            return;
-        }
+    const QString combined_text = (snapshot.title + " " + snapshot.summary + " " + snapshot.body).toLower();
 
-        auto data = obj["data"].toObject();
-        auto a = data["analysis"].toObject();
-        auto sent = a["sentiment"].toObject();
-        auto mi = a["market_impact"].toObject();
-        auto rs = a["risk_signals"].toObject();
+    NewsAnalysis analysis;
+    analysis.sentiment.score = article.sentiment == Sentiment::BULLISH ? 0.6 : article.sentiment == Sentiment::BEARISH ? -0.6 : 0.0;
+    analysis.sentiment.intensity = article.impact == Impact::HIGH ? 0.9 : article.impact == Impact::MEDIUM ? 0.6 : 0.3;
+    analysis.sentiment.confidence = std::max(0.45, article.threat.confidence);
+    analysis.market_impact.urgency = impact_string(article.impact);
+    analysis.market_impact.prediction = impact_prediction(article);
+    analysis.summary = snapshot.summary.isEmpty() ? snapshot.body.left(kSummaryMaxChars) : snapshot.summary;
+    analysis.keywords = top_terms(snapshot.title + " " + snapshot.summary + " " + snapshot.body, 8);
+    analysis.topics = derive_topics(article, combined_text);
+    analysis.key_points << snapshot.title;
+    if (!analysis.summary.isEmpty())
+        analysis.key_points << analysis.summary.left(180);
+    if (!article.tickers.isEmpty())
+        analysis.key_points << (QStringLiteral("Potentially affected tickers: ") + article.tickers.join(", "));
+    else
+        analysis.key_points << QString("Detected category: %1").arg(article.category);
 
-        NewsAnalysis analysis;
-        analysis.sentiment = {sent["score"].toDouble(), sent["intensity"].toDouble(), sent["confidence"].toDouble()};
-        analysis.market_impact = {mi["urgency"].toString(), mi["prediction"].toString()};
-        analysis.summary = a["summary"].toString();
-        analysis.credits_used = data["credits_used"].toInt();
-        analysis.credits_remaining = data["credits_remaining"].toInt();
+    analysis.regulatory = classify_signal(
+        combined_text,
+        {"sec", "antitrust", "sanction", "embargo", "lawsuit", "regulator", "investigation"},
+        {"policy", "tariff", "compliance", "probe"},
+        "Regulatory or legal friction appears prominent in the article",
+        "Regulatory follow-through may matter if the story develops");
+    analysis.geopolitical = classify_signal(
+        combined_text,
+        {"war", "missile", "military", "airstrike", "border", "sanction", "ceasefire"},
+        {"election", "diplomatic", "protest", "tension", "summit"},
+        "Geopolitical escalation markers were detected in the article",
+        "Geopolitical context is present but not dominant");
+    analysis.operational = classify_signal(
+        combined_text,
+        {"outage", "strike", "shutdown", "recall", "cyberattack", "disruption", "shortage"},
+        {"delay", "maintenance", "supply chain", "logistics"},
+        "Operational disruption risk is elevated",
+        "Operational execution may need monitoring");
+    analysis.market = classify_signal(
+        combined_text,
+        {"recession", "bankruptcy", "earnings miss", "flash crash", "trading halt", "downgrade"},
+        {"inflation", "rate", "volatility", "selloff", "guidance"},
+        "Market-sensitive downside catalysts were detected",
+        "Macro or market sensitivity is visible in the story");
+    analysis.credits_used = 0;
+    analysis.credits_remaining = 0;
 
-        for (const auto& v : a["keywords"].toArray())
-            analysis.keywords << v.toString();
-        for (const auto& v : a["topics"].toArray())
-            analysis.topics << v.toString();
-        for (const auto& v : a["key_points"].toArray())
-            analysis.key_points << v.toString();
-
-        auto reg = rs["regulatory"].toObject();
-        auto geo = rs["geopolitical"].toObject();
-        auto ops = rs["operational"].toObject();
-        auto mkt = rs["market"].toObject();
-        analysis.regulatory = {reg["level"].toString(), reg["details"].toString()};
-        analysis.geopolitical = {geo["level"].toString(), geo["details"].toString()};
-        analysis.operational = {ops["level"].toString(), ops["details"].toString()};
-        analysis.market = {mkt["level"].toString(), mkt["details"].toString()};
-
-        cb(true, analysis);
-        emit this->analysis_ready(analysis);
-    });
+    cb(true, analysis);
+    emit this->analysis_ready(analysis);
 }
 
-// ── AI Headline Summarization ────────────────────────────────────────────────
+// ── Local Headline Summarization ─────────────────────────────────────────────
 
 void NewsService::summarize_headlines(const QVector<NewsArticle>& articles, int count, SummaryCallback cb) {
     // Build headline signature for cache check
@@ -385,40 +643,24 @@ void NewsService::summarize_headlines(const QVector<NewsArticle>& articles, int 
         }
     }
 
-    // Build request body
-    QJsonArray headline_array;
-    for (const auto& h : headlines)
-        headline_array.append(h);
+    const QString summary = build_local_summary(articles, count);
+    if (!summary.isEmpty()) {
+        fincept::CacheManager::instance().put("news:summary:" + sig.left(200), QVariant(summary), kSummaryCacheTtlSec,
+                                              "news");
+    }
 
-    QJsonObject body;
-    body["headlines"] = headline_array;
-    body["count"] = count;
-
-    HttpClient::instance().post("/news/summarize", body, [this, cb, sig](Result<QJsonDocument> result) {
-        if (result.is_err()) {
-            LOG_WARN("NewsService", "Summarization failed: " + QString::fromStdString(result.error()));
-            cb(false, {});
-            return;
-        }
-
-        auto obj = result.value().object();
-        QString summary = obj["summary"].toString();
-        if (summary.isEmpty() && obj.contains("data"))
-            summary = obj["data"].toObject()["summary"].toString();
-
-        if (!summary.isEmpty()) {
-            fincept::CacheManager::instance().put("news:summary:" + sig.left(200), QVariant(summary),
-                                                  kSummaryCacheTtlSec, "news");
-        }
-
-        cb(!summary.isEmpty(), summary);
-    });
+    cb(!summary.isEmpty(), summary);
 }
 
 // ── WebSocket live feed ──────────────────────────────────────────────────────
 
 #ifdef HAS_QT_WEBSOCKETS
 void NewsService::connect_live_feed(const QString& ws_url) {
+    if (ws_url.trimmed().isEmpty()) {
+        LOG_INFO("NewsService", "Live news feed disabled: no local default WebSocket configured");
+        return;
+    }
+
     if (live_ws_)
         return; // already connected
 
@@ -509,7 +751,7 @@ void NewsService::connect_live_feed(const QString& ws_url) {
         LOG_INFO("NewsService", "Live article: " + article.headline.left(50));
     });
 
-    QString url = ws_url.isEmpty() ? "wss://api.fincept.in/ws/news" : ws_url;
+    QString url = ws_url.trimmed();
     live_ws_->open(QUrl(url));
 }
 

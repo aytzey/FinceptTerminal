@@ -8,8 +8,8 @@
 
 namespace fincept::screens::widgets {
 
-/// Economic Calendar Widget — fetches real macro events from
-/// GET http://api.fincept.in/macro/upcoming-events via HttpClient.
+/// Economic Calendar Widget — fetches real macro events from the local
+/// Investing calendar script.
 class EconomicCalendarWidget : public BaseWidget {
     Q_OBJECT
   public:

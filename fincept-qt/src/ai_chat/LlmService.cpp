@@ -557,6 +557,7 @@ void LlmService::ensure_config() const {
     }
 
     // Fallback: if no provider configured, prefer Codex OAuth when available.
+    // Do not silently fall back to Fincept.
     if (provider_.isEmpty()) {
         if (has_codex_oauth_auth()) {
             provider_ = CODEX_PROVIDER;
@@ -565,10 +566,7 @@ void LlmService::ensure_config() const {
             reasoning_effort_ = "high";
             LOG_INFO(TAG, "No LLM provider configured — using Codex OAuth default");
         } else {
-            provider_ = "fincept";
-            model_ = "MiniMax-M2.7";
-            base_url_ = {};
-            LOG_INFO(TAG, "No LLM provider configured — using Fincept default");
+            LOG_WARN(TAG, "No LLM provider configured and no Codex OAuth available");
         }
     }
 

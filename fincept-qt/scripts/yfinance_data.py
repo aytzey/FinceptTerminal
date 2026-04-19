@@ -6,7 +6,10 @@ Returns JSON output for Qt/C++ integration
 
 import sys
 import json
-import yfinance as yf
+try:
+    import yfinance as yf
+except Exception:
+    yf = None
 import pandas as pd
 from datetime import datetime
 
@@ -487,26 +490,27 @@ def search_symbols(query, limit=20):
                     })
         except Exception as search_err:
             # Fallback: try the exact symbol as a yfinance Ticker
-            query_upper = query_str.upper()
-            suffixes = ["", ".NS", ".BO"]
-            for suffix in suffixes:
-                candidate = query_upper + suffix
-                try:
-                    ticker = yf.Ticker(candidate)
-                    info = ticker.info
-                    if info.get("longName") or info.get("shortName"):
-                        results.append({
-                            "symbol": candidate,
-                            "name": info.get("longName", info.get("shortName", "")),
-                            "exchange": info.get("exchange", ""),
-                            "type": info.get("quoteType", "EQUITY"),
-                            "currency": info.get("currency", "USD"),
-                            "sector": info.get("sector", ""),
-                            "industry": info.get("industry", "")
-                        })
-                        break
-                except Exception:
-                    continue
+            if yf is not None:
+                query_upper = query_str.upper()
+                suffixes = ["", ".NS", ".BO"]
+                for suffix in suffixes:
+                    candidate = query_upper + suffix
+                    try:
+                        ticker = yf.Ticker(candidate)
+                        info = ticker.info
+                        if info.get("longName") or info.get("shortName"):
+                            results.append({
+                                "symbol": candidate,
+                                "name": info.get("longName", info.get("shortName", "")),
+                                "exchange": info.get("exchange", ""),
+                                "type": info.get("quoteType", "EQUITY"),
+                                "currency": info.get("currency", "USD"),
+                                "sector": info.get("sector", ""),
+                                "industry": info.get("industry", "")
+                            })
+                            break
+                    except Exception:
+                        continue
 
         return {"results": results, "query": query, "count": len(results)}
 

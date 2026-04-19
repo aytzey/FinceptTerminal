@@ -14,7 +14,7 @@
 namespace fincept::screens {
 namespace {
 
-static constexpr const char* kFinceptMacroSourceId = "fincept";
+static constexpr const char* kFinceptMacroSourceId = "local";
 static constexpr const char* kFinceptMacroColor = "#d97706"; // amber
 } // namespace
 
@@ -25,26 +25,25 @@ FinceptMacroPanel::FinceptMacroPanel(QWidget* parent)
 }
 
 void FinceptMacroPanel::activate() {
-    show_empty("Fincept Macro — Coming Soon\n\n"
-               "Planned data:\n"
-               "  · Central bank rates (40+ countries)\n"
-               "  · Sovereign debt metrics\n"
-               "  · Fincept proprietary macro indices\n"
-               "  · Global inflation dashboard\n"
-               "  · Emerging market indicators\n\n"
-               "Requires Fincept subscription + API key\n"
-               "Check back in a future release");
+    show_empty("Local Macro Sources\n\n"
+               "Available now elsewhere in Economics:\n"
+               "  · FRED\n"
+               "  · BLS\n"
+               "  · BEA\n"
+               "  · EIA\n"
+               "  · Trading Economics\n\n"
+               "This panel is reserved for a unified local macro view.");
 }
 
 void FinceptMacroPanel::build_controls(QHBoxLayout* thl) {
-    auto* lbl = new QLabel("FINCEPT MACRO — COMING SOON");
+    auto* lbl = new QLabel("LOCAL MACRO");
     lbl->setStyleSheet(ctrl_label_style() + "letter-spacing:1px;");
     thl->addWidget(lbl);
 }
 
 void FinceptMacroPanel::on_fetch() {
-    show_empty("Fincept Macro data script is not yet available.\n"
-               "This panel will be enabled in a future release.");
+    show_empty("Unified local macro view is not wired yet.\n"
+               "Use the existing free-source macro panels in the meantime.");
 }
 
 void FinceptMacroPanel::on_result(const QString& /*request_id*/, const services::EconomicsResult& /*result*/) {

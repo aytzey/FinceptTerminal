@@ -40,7 +40,8 @@ std::vector<ToolDef> get_markets_tools() {
     {
         ToolDef t;
         t.name = "search_symbol";
-        t.description = "Search for a ticker symbol by company name or partial symbol.";
+        t.description =
+            "Legacy UI search request for ticker symbols. Prefer search_market_assets for direct local results.";
         t.category = "markets";
         t.input_schema.properties =
             QJsonObject{{"query", QJsonObject{{"type", "string"},

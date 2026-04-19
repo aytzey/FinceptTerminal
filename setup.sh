@@ -140,9 +140,9 @@ install_linux_dev_integration() {
     fi
 }
 
-TOTAL_STEPS=7
+TOTAL_STEPS=8
 if [ "$PLATFORM" = "linux" ] && [ "$CI_MODE" = false ]; then
-    TOTAL_STEPS=8
+    TOTAL_STEPS=9
 fi
 
 # ── Step 1: System dependencies (build tools only) ──────────
@@ -257,8 +257,17 @@ echo "[7/${TOTAL_STEPS}] Compiling..."
 cmake --build --preset "$PRESET" || fail "Build failed. See error above."
 ok
 
+# ── Step 8: Python runtime env ──────────────────────────────
+echo "[8/${TOTAL_STEPS}] Preparing Python runtime..."
+RUNTIME_VENV="$APP_DIR/build/$PRESET/venv-numpy2"
+[ -x "$RUNTIME_VENV/bin/python3" ] || "$PYTHON" -m venv "$RUNTIME_VENV"
+"$RUNTIME_VENV/bin/python3" -m pip install --quiet --upgrade pip
+"$RUNTIME_VENV/bin/python3" -m pip install --quiet yfinance requests beautifulsoup4 \
+    || fail "Python runtime dependency install failed."
+ok
+
 if [ "$PLATFORM" = "linux" ] && [ "$CI_MODE" = false ]; then
-    echo "[8/${TOTAL_STEPS}] Installing Linux development launcher..."
+    echo "[9/${TOTAL_STEPS}] Installing Linux development launcher..."
     install_linux_dev_integration
     ok
 fi
