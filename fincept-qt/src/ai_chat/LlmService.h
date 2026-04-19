@@ -7,6 +7,7 @@
 #include "core/result/Result.h"
 #include "storage/repositories/LlmProfileRepository.h"
 
+#include <QDateTime>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QMutex>
@@ -14,6 +15,7 @@
 #include <QObject>
 #include <QString>
 #include <QStringList>
+#include <QVector>
 
 #include <functional>
 #include <optional>
@@ -26,11 +28,11 @@ namespace fincept::ai_chat {
 inline bool provider_supports_streaming(const QString& provider) {
     return provider == "openai" || provider == "anthropic" || provider == "gemini" || provider == "google" ||
            provider == "groq" || provider == "deepseek" || provider == "openrouter" || provider == "minimax" ||
-           provider == "ollama" || provider == "fincept";
+           provider == "ollama" || provider == "fincept" || provider == "openai-codex";
 }
 
 inline bool provider_requires_api_key(const QString& provider) {
-    return provider != "ollama" && provider != "fincept";
+    return provider != "ollama" && provider != "fincept" && provider != "openai-codex";
 }
 
 // ── Data types ────────────────────────────────────────────────────────────────
@@ -119,6 +121,7 @@ class LlmService : public QObject {
     mutable double temperature_ = 0.7;
     mutable int max_tokens_ = 4096;
     mutable QString system_prompt_;
+    mutable QString reasoning_effort_ = "medium";
     mutable bool tools_enabled_ = true;
     mutable bool config_loaded_ = false;
 
@@ -127,6 +130,9 @@ class LlmService : public QObject {
     // Request builders → QJsonObject
     QJsonObject build_openai_request(const QString& user_message, const std::vector<ConversationMessage>& history,
                                      bool stream, bool with_tools = true);
+    QJsonArray build_codex_input_items(const QString& user_message,
+                                       const std::vector<ConversationMessage>& history) const;
+    QJsonObject build_codex_request(const QJsonArray& input_items, bool with_tools = true) const;
     QJsonObject build_anthropic_request(const QString& user_message, const std::vector<ConversationMessage>& history,
                                         bool stream);
     QJsonObject build_gemini_request(const QString& user_message, const std::vector<ConversationMessage>& history);
@@ -141,9 +147,11 @@ class LlmService : public QObject {
     LlmResponse do_request(const QString& user_message, const std::vector<ConversationMessage>& history);
     LlmResponse do_streaming_request(const QString& user_message, const std::vector<ConversationMessage>& history,
                                      StreamCallback on_chunk);
+    LlmResponse do_codex_request(const QString& user_message, const std::vector<ConversationMessage>& history);
 
     // Tool-call follow-up loop (OpenAI-compatible)
     LlmResponse do_tool_loop(QJsonArray loop_messages, const QString& url, const QMap<QString, QString>& headers);
+    LlmResponse do_codex_tool_loop(QJsonArray input_items, const QString& url, const QMap<QString, QString>& headers);
 
     // Detect and execute tool calls embedded as text/XML in the response content.
     // Returns std::nullopt if no text-based tool calls were found.
@@ -161,6 +169,26 @@ class LlmService : public QObject {
 
     // Parse token usage from response JSON
     static void parse_usage(LlmResponse& resp, const QJsonObject& rj, const QString& provider);
+
+    struct CodexToolCall {
+        QString id;
+        QString name;
+        QJsonObject input;
+    };
+
+    struct CodexParsedResponse {
+        QString text;
+        QVector<CodexToolCall> tool_calls;
+        int prompt_tokens = 0;
+        int completion_tokens = 0;
+        int total_tokens = 0;
+        QString error;
+        bool success = false;
+    };
+
+    static Result<QPair<QString, QString>> resolve_codex_auth_context(bool force_refresh = false);
+    static bool has_codex_oauth_auth();
+    static CodexParsedResponse parse_codex_sse_response(const QByteArray& body);
 
     // Synchronous POST helper (blocks calling thread via QEventLoop)
     struct HttpResult {

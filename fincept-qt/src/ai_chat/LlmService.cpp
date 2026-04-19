@@ -14,7 +14,10 @@
 #    include "datahub/DataHub.h"
 #    include "datahub/TopicPolicy.h"
 
+#include <QDir>
 #include <QEventLoop>
+#include <QFile>
+#include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonValue>
@@ -23,15 +26,478 @@
 #include <QNetworkRequest>
 #include <QPointer>
 #include <QRegularExpression>
+#include <QSaveFile>
 #include <QThread>
 #include <QTimer>
 #include <QUuid>
+#include <QUrl>
+#include <QUrlQuery>
 #include <QVariant>
 #include <QtConcurrent/QtConcurrent>
 
 namespace fincept::ai_chat {
 
 static constexpr const char* TAG = "LlmService";
+
+namespace {
+
+static constexpr const char* CODEX_PROVIDER = "openai-codex";
+static constexpr const char* CODEX_DEFAULT_BASE_URL = "https://chatgpt.com/backend-api/codex";
+static constexpr const char* CODEX_DEFAULT_TOKEN_URL = "https://auth.openai.com/oauth/token";
+static constexpr const char* CODEX_FALLBACK_TOKEN_URL = "https://auth0.openai.com/oauth/token";
+static constexpr const char* CODEX_DEFAULT_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+static constexpr int CODEX_MAX_TOOL_ROUNDS = 5;
+
+struct CodexAuthStateData {
+    QString path;
+    QJsonObject raw_json;
+    QString access_token;
+    QString refresh_token;
+    QString id_token;
+    QString account_id;
+    QString client_id;
+    QDateTime expires_at;
+};
+
+struct RawHttpResult {
+    bool success = false;
+    int status = 0;
+    QByteArray body;
+    QString error;
+};
+
+RawHttpResult raw_http_request(const QString& method, const QString& url, const QByteArray& body,
+                               const QMap<QString, QString>& headers, int timeout_ms = 30000) {
+    RawHttpResult result;
+    QNetworkAccessManager nam;
+    QNetworkRequest req{QUrl(url)};
+    req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+    for (auto it = headers.constBegin(); it != headers.constEnd(); ++it)
+        req.setRawHeader(it.key().toUtf8(), it.value().toUtf8());
+
+    QNetworkReply* reply = (method == "GET") ? nam.get(req) : nam.post(req, body);
+
+    QEventLoop loop;
+    QTimer timer;
+    timer.setSingleShot(true);
+    timer.start(timeout_ms);
+    QObject::connect(&timer, &QTimer::timeout, &loop, &QEventLoop::quit);
+    QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+    loop.exec();
+
+    if (!reply->isFinished()) {
+        reply->abort();
+        reply->deleteLater();
+        result.error = "Request timed out";
+        return result;
+    }
+
+    result.status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+    result.body = reply->readAll();
+    result.success = (result.status >= 200 && result.status < 300);
+    if (!result.success) {
+        QString server_msg;
+        auto err_doc = QJsonDocument::fromJson(result.body);
+        if (!err_doc.isNull() && err_doc.isObject()) {
+            const auto err_obj = err_doc.object();
+            if (err_obj.contains("error")) {
+                if (err_obj["error"].isString())
+                    server_msg = err_obj["error"].toString();
+                else if (err_obj["error"].isObject())
+                    server_msg = err_obj["error"].toObject()["message"].toString();
+            }
+            if (server_msg.isEmpty() && err_obj.contains("message") && err_obj["message"].isString())
+                server_msg = err_obj["message"].toString();
+        }
+        result.error = server_msg.isEmpty() ? QString("HTTP %1: %2").arg(result.status).arg(reply->errorString())
+                                            : QString("HTTP %1: %2").arg(result.status).arg(server_msg);
+    }
+    reply->deleteLater();
+    return result;
+}
+
+QString codex_auth_path() {
+    return QDir(QDir::homePath()).filePath(".codex/auth.json");
+}
+
+QJsonValue json_pointer_value(const QJsonObject& root, const QString& pointer) {
+    if (!pointer.startsWith('/'))
+        return {};
+
+    QJsonValue current(root);
+    const QStringList parts = pointer.mid(1).split('/', Qt::KeepEmptyParts);
+    for (QString part : parts) {
+        part.replace("~1", "/");
+        part.replace("~0", "~");
+        if (current.isObject()) {
+            current = current.toObject().value(part);
+        } else if (current.isArray()) {
+            bool ok = false;
+            int index = part.toInt(&ok);
+            if (!ok)
+                return {};
+            const QJsonArray array = current.toArray();
+            if (index < 0 || index >= array.size())
+                return {};
+            current = array.at(index);
+        } else {
+            return {};
+        }
+        if (current.isUndefined())
+            return {};
+    }
+    return current;
+}
+
+QString extract_string_by_pointers(const QJsonObject& root, std::initializer_list<const char*> pointers) {
+    for (const char* ptr : pointers) {
+        const QJsonValue value = json_pointer_value(root, QString::fromUtf8(ptr));
+        if (value.isString()) {
+            const QString text = value.toString().trimmed();
+            if (!text.isEmpty())
+                return text;
+        }
+    }
+    return {};
+}
+
+QByteArray decode_jwt_segment(QString segment) {
+    segment = segment.trimmed();
+    segment.replace('-', '+');
+    segment.replace('_', '/');
+    while (segment.size() % 4 != 0)
+        segment += '=';
+    return QByteArray::fromBase64(segment.toUtf8());
+}
+
+QJsonObject jwt_payload(const QString& jwt) {
+    const QStringList parts = jwt.split('.');
+    if (parts.size() < 2)
+        return {};
+    const QByteArray decoded = decode_jwt_segment(parts[1]);
+    const auto doc = QJsonDocument::fromJson(decoded);
+    return doc.isObject() ? doc.object() : QJsonObject();
+}
+
+QString jwt_chatgpt_account_id(const QString& jwt) {
+    const QJsonObject payload = jwt_payload(jwt);
+    if (payload.isEmpty())
+        return {};
+
+    auto extract = [](const QJsonValue& value) -> QString {
+        if (!value.isString())
+            return {};
+        const QString text = value.toString().trimmed();
+        return text;
+    };
+
+    QString account_id = extract(payload.value("https://api.openai.com/auth.chatgpt_account_id"));
+    if (!account_id.isEmpty())
+        return account_id;
+    account_id = extract(payload.value("chatgpt_account_id"));
+    if (!account_id.isEmpty())
+        return account_id;
+
+    const QJsonObject nested = payload.value("https://api.openai.com/auth").toObject();
+    return extract(nested.value("chatgpt_account_id"));
+}
+
+QString jwt_client_id_from_id_token(const QString& jwt) {
+    const QJsonObject payload = jwt_payload(jwt);
+    if (payload.isEmpty())
+        return {};
+
+    if (payload.value("aud").isString())
+        return payload.value("aud").toString().trimmed();
+    if (payload.value("aud").isArray()) {
+        const QJsonArray aud = payload.value("aud").toArray();
+        for (const auto& value : aud) {
+            if (!value.isString())
+                continue;
+            const QString text = value.toString().trimmed();
+            if (!text.isEmpty())
+                return text;
+        }
+    }
+    return {};
+}
+
+QDateTime jwt_expiry_utc(const QString& jwt) {
+    const QJsonObject payload = jwt_payload(jwt);
+    if (payload.isEmpty())
+        return {};
+    const qint64 exp = payload.value("exp").toVariant().toLongLong();
+    if (exp <= 0)
+        return {};
+    return QDateTime::fromSecsSinceEpoch(exp, Qt::UTC);
+}
+
+QDateTime extract_expiry(const QJsonObject& root) {
+    const QStringList pointers = {"/expires_at", "/expiresAt", "/token/expires_at", "/tokens/expires_at"};
+    for (const auto& ptr : pointers) {
+        const QJsonValue value = json_pointer_value(root, ptr);
+        if (value.isDouble()) {
+            qint64 ts = value.toVariant().toLongLong();
+            if (ts > 2'000'000'000'000LL)
+                ts /= 1000;
+            if (ts > 0)
+                return QDateTime::fromSecsSinceEpoch(ts, Qt::UTC);
+        }
+        if (value.isString()) {
+            const QDateTime dt = QDateTime::fromString(value.toString(), Qt::ISODate);
+            if (dt.isValid())
+                return dt.toUTC();
+        }
+    }
+
+    qint64 expires_in = 0;
+    const QJsonValue top = json_pointer_value(root, "/expires_in");
+    const QJsonValue nested = json_pointer_value(root, "/token/expires_in");
+    if (top.isDouble())
+        expires_in = top.toVariant().toLongLong();
+    else if (nested.isDouble())
+        expires_in = nested.toVariant().toLongLong();
+    if (expires_in > 0)
+        return QDateTime::currentDateTimeUtc().addSecs(expires_in);
+
+    return {};
+}
+
+bool token_expiring_soon(const QDateTime& expires_at) {
+    return expires_at.isValid() && expires_at <= QDateTime::currentDateTimeUtc().addSecs(60);
+}
+
+QByteArray compact_json(const QJsonObject& obj) {
+    return QJsonDocument(obj).toJson(QJsonDocument::Compact);
+}
+
+QJsonValue make_strict_schema(const QJsonValue& value) {
+    if (!value.isObject())
+        return value;
+
+    QJsonObject obj = value.toObject();
+    const bool is_object_schema = obj.value("type").toString() == "object" || obj.contains("properties");
+    if (is_object_schema) {
+        obj["additionalProperties"] = false;
+        const QJsonObject props = obj.value("properties").toObject();
+        if (!props.isEmpty()) {
+            QJsonArray required;
+            for (auto it = props.constBegin(); it != props.constEnd(); ++it)
+                required.append(it.key());
+            obj["required"] = required;
+        }
+    }
+
+    if (obj.contains("properties")) {
+        QJsonObject props = obj.value("properties").toObject();
+        for (auto it = props.begin(); it != props.end(); ++it)
+            it.value() = make_strict_schema(it.value());
+        obj["properties"] = props;
+    }
+
+    if (obj.contains("items")) {
+        const QJsonValue items = obj.value("items");
+        if (items.isObject())
+            obj["items"] = make_strict_schema(items);
+        else if (items.isArray()) {
+            QJsonArray arr = items.toArray();
+            for (int i = 0; i < arr.size(); ++i)
+                arr[i] = make_strict_schema(arr[i]);
+            obj["items"] = arr;
+        }
+    }
+
+    for (const auto& key : {"anyOf", "oneOf", "allOf"}) {
+        if (!obj.contains(key) || !obj.value(key).isArray())
+            continue;
+        QJsonArray arr = obj.value(key).toArray();
+        for (int i = 0; i < arr.size(); ++i)
+            arr[i] = make_strict_schema(arr[i]);
+        obj[key] = arr;
+    }
+
+    return obj;
+}
+
+QJsonArray format_tools_for_codex() {
+    QJsonArray result;
+    const auto tools = mcp::McpService::instance().get_all_tools();
+    for (const auto& tool : tools) {
+        QString fn_name = tool.server_id + "__" + tool.name;
+        QJsonObject schema = tool.input_schema;
+        if (schema.isEmpty()) {
+            schema["type"] = "object";
+            schema["properties"] = QJsonObject();
+        }
+        schema = make_strict_schema(schema).toObject();
+        result.append(QJsonObject{
+            {"type", "function"},
+            {"name", fn_name},
+            {"description", tool.description},
+            {"parameters", schema},
+        });
+    }
+    return result;
+}
+
+QString codex_default_instructions(const QString& system_prompt) {
+    const QString trimmed = system_prompt.trimmed();
+    if (!trimmed.isEmpty())
+        return trimmed;
+    return "You are Fincept AI, a helpful assistant embedded inside Fincept Terminal.";
+}
+
+void hydrate_codex_auth_state(CodexAuthStateData& state) {
+    if (state.account_id.trimmed().isEmpty()) {
+        state.account_id = jwt_chatgpt_account_id(state.access_token);
+        if (state.account_id.isEmpty())
+            state.account_id = jwt_chatgpt_account_id(state.id_token);
+    }
+
+    if (state.client_id.trimmed().isEmpty())
+        state.client_id = jwt_client_id_from_id_token(state.id_token);
+    if (state.client_id.trimmed().isEmpty())
+        state.client_id = QString::fromUtf8(CODEX_DEFAULT_CLIENT_ID);
+
+    if (!state.expires_at.isValid())
+        state.expires_at = extract_expiry(state.raw_json);
+    if (!state.expires_at.isValid())
+        state.expires_at = jwt_expiry_utc(state.access_token);
+}
+
+Result<CodexAuthStateData> load_codex_auth_state_data() {
+    CodexAuthStateData state;
+    state.path = codex_auth_path();
+    QFile file(state.path);
+    if (!file.exists()) {
+        return Result<CodexAuthStateData>::err("Codex OAuth auth not found at ~/.codex/auth.json");
+    }
+    if (!file.open(QIODevice::ReadOnly)) {
+        return Result<CodexAuthStateData>::err("Failed to read Codex OAuth auth file");
+    }
+
+    const auto doc = QJsonDocument::fromJson(file.readAll());
+    if (!doc.isObject())
+        return Result<CodexAuthStateData>::err("Invalid JSON in ~/.codex/auth.json");
+
+    state.raw_json = doc.object();
+    state.access_token = extract_string_by_pointers(
+        state.raw_json,
+        {"/access_token", "/accessToken", "/token", "/token/access_token", "/tokens/access_token",
+         "/credentials/access_token"});
+    state.refresh_token = extract_string_by_pointers(
+        state.raw_json, {"/refresh_token", "/refreshToken", "/token/refresh_token", "/tokens/refresh_token",
+                         "/credentials/refresh_token"});
+    state.id_token = extract_string_by_pointers(state.raw_json,
+                                                {"/id_token", "/idToken", "/token/id_token", "/tokens/id_token"});
+    state.account_id = extract_string_by_pointers(
+        state.raw_json, {"/account_id", "/token/account_id", "/tokens/account_id", "/credentials/account_id"});
+    state.client_id = extract_string_by_pointers(state.raw_json, {"/client_id", "/clientId"});
+    state.expires_at = extract_expiry(state.raw_json);
+    hydrate_codex_auth_state(state);
+    return Result<CodexAuthStateData>::ok(state);
+}
+
+Result<void> save_codex_auth_state_data(const CodexAuthStateData& state) {
+    if (state.path.isEmpty())
+        return Result<void>::err("Codex OAuth auth path is empty");
+
+    const QFileInfo info(state.path);
+    QDir().mkpath(info.dir().absolutePath());
+
+    QJsonObject root = state.raw_json;
+    QJsonObject tokens = root.value("tokens").toObject();
+    if (!state.access_token.isEmpty())
+        tokens["access_token"] = state.access_token;
+    if (!state.refresh_token.isEmpty())
+        tokens["refresh_token"] = state.refresh_token;
+    if (!state.id_token.isEmpty())
+        tokens["id_token"] = state.id_token;
+    if (!state.account_id.isEmpty())
+        tokens["account_id"] = state.account_id;
+    root["tokens"] = tokens;
+    root["auth_mode"] = "chatgpt";
+    root["last_refresh"] = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
+    if (!state.client_id.isEmpty())
+        root["client_id"] = state.client_id;
+    if (state.expires_at.isValid())
+        root["expires_at"] = state.expires_at.toUTC().toString(Qt::ISODate);
+
+    QSaveFile file(state.path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        return Result<void>::err("Failed to write Codex OAuth auth file");
+    file.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+    if (!file.commit())
+        return Result<void>::err("Failed to save Codex OAuth auth file");
+    return Result<void>::ok();
+}
+
+Result<CodexAuthStateData> refresh_codex_auth_state_data(CodexAuthStateData state) {
+    if (state.refresh_token.trimmed().isEmpty()) {
+        return Result<CodexAuthStateData>::err(
+            "Codex OAuth access token is missing and no refresh token is available");
+    }
+
+    const QString client_id =
+        state.client_id.trimmed().isEmpty() ? QString::fromUtf8(CODEX_DEFAULT_CLIENT_ID) : state.client_id.trimmed();
+
+    QUrlQuery form;
+    form.addQueryItem("grant_type", "refresh_token");
+    form.addQueryItem("refresh_token", state.refresh_token);
+    form.addQueryItem("client_id", client_id);
+
+    QMap<QString, QString> headers;
+    headers["Content-Type"] = "application/x-www-form-urlencoded";
+    headers["Accept"] = "application/json";
+
+    QString last_error = "Codex OAuth token refresh failed";
+    for (const auto& token_url :
+         {QString::fromUtf8(CODEX_DEFAULT_TOKEN_URL), QString::fromUtf8(CODEX_FALLBACK_TOKEN_URL)}) {
+        const auto http =
+            raw_http_request("POST", token_url, form.query(QUrl::FullyEncoded).toUtf8(), headers, 30000);
+        if (!http.success) {
+            last_error = http.error;
+            continue;
+        }
+
+        const auto doc = QJsonDocument::fromJson(http.body);
+        if (!doc.isObject()) {
+            last_error = "Codex OAuth refresh returned invalid JSON";
+            continue;
+        }
+
+        const QJsonObject refresh = doc.object();
+        const QString access_token = extract_string_by_pointers(refresh, {"/access_token"});
+        if (access_token.isEmpty()) {
+            last_error = "Codex OAuth refresh did not return an access token";
+            continue;
+        }
+
+        state.access_token = access_token;
+        const QString refresh_token = extract_string_by_pointers(refresh, {"/refresh_token"});
+        if (!refresh_token.isEmpty())
+            state.refresh_token = refresh_token;
+        const QString id_token = extract_string_by_pointers(refresh, {"/id_token"});
+        if (!id_token.isEmpty())
+            state.id_token = id_token;
+
+        state.client_id = client_id;
+        state.raw_json["token"] = refresh;
+        state.expires_at = extract_expiry(refresh);
+        if (!state.expires_at.isValid())
+            state.expires_at = jwt_expiry_utc(state.access_token);
+        hydrate_codex_auth_state(state);
+
+        const auto save_result = save_codex_auth_state_data(state);
+        if (save_result.is_err())
+            return Result<CodexAuthStateData>::err(save_result.error());
+        return Result<CodexAuthStateData>::ok(state);
+    }
+
+    return Result<CodexAuthStateData>::err(last_error.toStdString());
+}
+
+} // namespace
 
 // ============================================================================
 // Singleton
@@ -61,6 +527,7 @@ void LlmService::ensure_config() const {
     provider_ = model_ = api_key_ = base_url_ = system_prompt_ = {};
     temperature_ = 0.7;
     max_tokens_ = 4096;
+    reasoning_effort_ = "medium";
     tools_enabled_ = true;
 
     auto providers = LlmConfigRepository::instance().list_providers();
@@ -71,6 +538,7 @@ void LlmService::ensure_config() const {
                 api_key_ = c.api_key;
                 base_url_ = c.base_url;
                 model_ = c.model;
+                reasoning_effort_ = c.reasoning_effort;
                 tools_enabled_ = c.tools_enabled;
                 break;
             }
@@ -82,6 +550,7 @@ void LlmService::ensure_config() const {
             api_key_ = c.api_key;
             base_url_ = c.base_url;
             model_ = c.model;
+            reasoning_effort_ = c.reasoning_effort;
             tools_enabled_ = c.tools_enabled;
         }
     }
@@ -100,6 +569,9 @@ void LlmService::ensure_config() const {
         if (stored_key.is_ok() && !stored_key.value().isEmpty())
             api_key_ = stored_key.value();
     }
+
+    if (reasoning_effort_.trimmed().isEmpty())
+        reasoning_effort_ = "medium";
 
     auto gs = LlmConfigRepository::instance().get_global_settings();
     if (gs.is_ok()) {
@@ -179,6 +651,8 @@ bool LlmService::is_configured() const {
     ensure_config();
     if (provider_.isEmpty())
         return false;
+    if (provider_ == CODEX_PROVIDER)
+        return has_codex_oauth_auth();
     if (provider_requires_api_key(provider_))
         return !api_key_.isEmpty();
     return true;
@@ -227,11 +701,15 @@ QString LlmService::get_endpoint_url() const {
             base.chop(1);
         if (p == "anthropic")
             return base + "/v1/messages";
+        if (p == CODEX_PROVIDER)
+            return base.endsWith("/responses") ? base : base + "/responses";
         return base + "/v1/chat/completions";
     }
 
     if (p == "openai")
         return "https://api.openai.com/v1/chat/completions";
+    if (p == CODEX_PROVIDER)
+        return QString::fromUtf8(CODEX_DEFAULT_BASE_URL) + "/responses";
     if (p == "anthropic")
         return "https://api.anthropic.com/v1/messages";
     if (p == "gemini" || p == "google")
@@ -258,6 +736,10 @@ QMap<QString, QString> LlmService::get_headers() const {
         if (!api_key_.isEmpty())
             h["x-api-key"] = api_key_;
         h["anthropic-version"] = "2024-10-22";
+    } else if (p == CODEX_PROVIDER) {
+        h["Accept"] = "text/event-stream";
+        h["openai-beta"] = "responses=experimental";
+        h["originator"] = "pi";
     } else if (p == "gemini" || p == "google") {
         if (!api_key_.isEmpty())
             h["x-goog-api-key"] = api_key_;
@@ -311,6 +793,66 @@ QJsonObject LlmService::build_openai_request(const QString& user_message,
         if (!tools.isEmpty())
             req["tools"] = tools;
     }
+    return req;
+}
+
+QJsonArray LlmService::build_codex_input_items(const QString& user_message,
+                                               const std::vector<ConversationMessage>& history) const {
+    QJsonArray items;
+
+    auto append_message = [&items](const QString& role, const QString& text, const QString& part_type) {
+        const QString trimmed = text.trimmed();
+        if (trimmed.isEmpty())
+            return;
+        items.append(QJsonObject{
+            {"type", "message"},
+            {"role", role},
+            {"content", QJsonArray{QJsonObject{{"type", part_type}, {"text", trimmed}}}},
+        });
+    };
+
+    for (const auto& message : history) {
+        if (message.role == "system")
+            continue;
+        if (message.role == "assistant")
+            append_message("assistant", message.content, "output_text");
+        else
+            append_message("user", message.content, "input_text");
+    }
+
+    append_message("user", user_message, "input_text");
+
+    if (items.isEmpty()) {
+        items.append(QJsonObject{
+            {"type", "message"},
+            {"role", "user"},
+            {"content", QJsonArray{QJsonObject{{"type", "input_text"}, {"text", "Continue."}}}},
+        });
+    }
+
+    return items;
+}
+
+QJsonObject LlmService::build_codex_request(const QJsonArray& input_items, bool with_tools) const {
+    QJsonObject req;
+    req["model"] = model_;
+    req["stream"] = true;
+    req["store"] = false;
+    req["instructions"] = codex_default_instructions(system_prompt_);
+    req["input"] = input_items;
+
+    if (with_tools && tools_enabled_) {
+        const QJsonArray tools = format_tools_for_codex();
+        if (!tools.isEmpty()) {
+            req["tools"] = tools;
+            req["tool_choice"] = "auto";
+        }
+    }
+
+    const QString effort = reasoning_effort_.trimmed().toLower();
+    if (effort == "low" || effort == "medium" || effort == "high")
+        req["reasoning"] = QJsonObject{{"effort", effort}};
+
     return req;
 }
 
@@ -678,6 +1220,9 @@ LlmResponse LlmService::fincept_async_request(const QString& user_message,
 LlmResponse LlmService::do_request(const QString& user_message, const std::vector<ConversationMessage>& history) {
     LlmResponse resp;
 
+    if (provider_ == CODEX_PROVIDER)
+        return do_codex_request(user_message, history);
+
     QString url = get_endpoint_url();
     if (url.isEmpty()) {
         resp.error = "No endpoint URL for provider: " + provider_;
@@ -966,9 +1511,130 @@ LlmResponse LlmService::do_request(const QString& user_message, const std::vecto
     return resp;
 }
 
+LlmResponse LlmService::do_codex_request(const QString& user_message, const std::vector<ConversationMessage>& history) {
+    LlmResponse resp;
+
+    const QString url = get_endpoint_url();
+    if (url.isEmpty()) {
+        resp.error = "No endpoint URL for provider: " + provider_;
+        return resp;
+    }
+
+    auto auth_ctx = resolve_codex_auth_context(false);
+    if (auth_ctx.is_err()) {
+        resp.error = QString::fromStdString(auth_ctx.error());
+        return resp;
+    }
+
+    auto headers = get_headers();
+    headers["Authorization"] = "Bearer " + auth_ctx.value().first;
+    headers["chatgpt-account-id"] = auth_ctx.value().second;
+
+    const QJsonArray input_items = build_codex_input_items(user_message, history);
+    const QJsonObject req_body = build_codex_request(input_items, true);
+
+    auto http = blocking_post(url, req_body, headers);
+    if (!http.success && http.status == 401) {
+        auto refreshed = resolve_codex_auth_context(true);
+        if (refreshed.is_ok()) {
+            headers["Authorization"] = "Bearer " + refreshed.value().first;
+            headers["chatgpt-account-id"] = refreshed.value().second;
+            http = blocking_post(url, req_body, headers);
+        }
+    }
+    if (!http.success) {
+        resp.error = http.error;
+        return resp;
+    }
+
+    const CodexParsedResponse parsed = parse_codex_sse_response(http.body);
+    if (!parsed.success) {
+        resp.error = parsed.error.isEmpty() ? "Failed to parse Codex response" : parsed.error;
+        return resp;
+    }
+
+    if (!parsed.tool_calls.isEmpty()) {
+        QJsonArray loop_items = input_items;
+        for (const auto& tool_call : parsed.tool_calls) {
+            loop_items.append(QJsonObject{
+                {"type", "function_call"},
+                {"call_id", tool_call.id},
+                {"name", tool_call.name},
+                {"arguments", QString::fromUtf8(compact_json(tool_call.input))},
+            });
+
+            const auto tool_result = mcp::McpService::instance().execute_openai_function(tool_call.name, tool_call.input);
+            loop_items.append(QJsonObject{
+                {"type", "function_call_output"},
+                {"call_id", tool_call.id},
+                {"output", QString::fromUtf8(QJsonDocument(tool_result.to_json()).toJson(QJsonDocument::Compact))},
+            });
+        }
+        return do_codex_tool_loop(loop_items, url, headers);
+    }
+
+    resp.content = parsed.text;
+    resp.prompt_tokens = parsed.prompt_tokens;
+    resp.completion_tokens = parsed.completion_tokens;
+    resp.total_tokens = parsed.total_tokens;
+    resp.success = !resp.content.isEmpty();
+    if (!resp.success)
+        resp.error = "Codex response was empty";
+    return resp;
+}
+
 // ============================================================================
 // Tool-call follow-up loop (OpenAI-compatible)
 // ============================================================================
+
+LlmResponse LlmService::do_codex_tool_loop(QJsonArray input_items, const QString& url,
+                                           const QMap<QString, QString>& headers) {
+    LlmResponse resp;
+
+    for (int round = 0; round < CODEX_MAX_TOOL_ROUNDS; ++round) {
+        const auto http = blocking_post(url, build_codex_request(input_items, true), headers);
+        if (!http.success) {
+            resp.error = "Codex tool follow-up failed: " + http.error;
+            return resp;
+        }
+
+        const CodexParsedResponse parsed = parse_codex_sse_response(http.body);
+        if (!parsed.success) {
+            resp.error = parsed.error.isEmpty() ? "Failed to parse Codex tool follow-up" : parsed.error;
+            return resp;
+        }
+
+        if (parsed.tool_calls.isEmpty()) {
+            resp.content = parsed.text;
+            resp.prompt_tokens = parsed.prompt_tokens;
+            resp.completion_tokens = parsed.completion_tokens;
+            resp.total_tokens = parsed.total_tokens;
+            resp.success = !resp.content.isEmpty();
+            if (!resp.success)
+                resp.error = "Codex tool follow-up returned an empty response";
+            return resp;
+        }
+
+        for (const auto& tool_call : parsed.tool_calls) {
+            input_items.append(QJsonObject{
+                {"type", "function_call"},
+                {"call_id", tool_call.id},
+                {"name", tool_call.name},
+                {"arguments", QString::fromUtf8(compact_json(tool_call.input))},
+            });
+
+            const auto tool_result = mcp::McpService::instance().execute_openai_function(tool_call.name, tool_call.input);
+            input_items.append(QJsonObject{
+                {"type", "function_call_output"},
+                {"call_id", tool_call.id},
+                {"output", QString::fromUtf8(QJsonDocument(tool_result.to_json()).toJson(QJsonDocument::Compact))},
+            });
+        }
+    }
+
+    resp.error = "Codex tool call loop exceeded maximum rounds";
+    return resp;
+}
 
 LlmResponse LlmService::do_tool_loop(QJsonArray loop_messages, const QString& url,
                                      const QMap<QString, QString>& headers) {
@@ -1565,6 +2231,199 @@ QString LlmService::parse_sse_chunk(const QString& data, const QString& provider
     return {};
 }
 
+bool LlmService::has_codex_oauth_auth() {
+    const auto state = load_codex_auth_state_data();
+    if (state.is_err())
+        return false;
+    return !state.value().access_token.trimmed().isEmpty() || !state.value().refresh_token.trimmed().isEmpty();
+}
+
+Result<QPair<QString, QString>> LlmService::resolve_codex_auth_context(bool force_refresh) {
+    auto state_result = load_codex_auth_state_data();
+    if (state_result.is_err())
+        return Result<QPair<QString, QString>>::err(state_result.error());
+
+    CodexAuthStateData state = state_result.value();
+    if (force_refresh || state.access_token.trimmed().isEmpty() || token_expiring_soon(state.expires_at)) {
+        auto refreshed = refresh_codex_auth_state_data(state);
+        if (refreshed.is_ok())
+            state = refreshed.value();
+        else if (state.access_token.trimmed().isEmpty()) {
+            return Result<QPair<QString, QString>>::err(refreshed.error());
+        }
+    }
+
+    hydrate_codex_auth_state(state);
+    if (state.account_id.trimmed().isEmpty()) {
+        return Result<QPair<QString, QString>>::err(
+            "Codex OAuth token is missing chatgpt_account_id. Reconnect Codex/ChatGPT first.");
+    }
+    if (state.access_token.trimmed().isEmpty()) {
+        return Result<QPair<QString, QString>>::err("Codex OAuth access token is missing");
+    }
+
+    return Result<QPair<QString, QString>>::ok(qMakePair(state.access_token, state.account_id));
+}
+
+LlmService::CodexParsedResponse LlmService::parse_codex_sse_response(const QByteArray& body) {
+    CodexParsedResponse parsed;
+    parsed.success = true;
+
+    QString current_event;
+    QString current_data;
+    QString text_accum;
+    QHash<QString, QPair<QString, QString>> tool_meta;
+    QHash<QString, QString> tool_args;
+    QVector<CodexToolCall> fallback_tool_calls;
+    QJsonObject completed_response;
+
+    auto handle_event = [&](const QString& event_name, const QString& data) {
+        const auto doc = QJsonDocument::fromJson(data.toUtf8());
+        if (!doc.isObject())
+            return;
+        const QJsonObject json = doc.object();
+
+        if (event_name == "response.output_text.delta") {
+            text_accum += json.value("delta").toString();
+            return;
+        }
+
+        if (event_name == "response.output_item.added") {
+            const QJsonObject item = json.value("item").toObject();
+            if (item.value("type").toString() != "function_call")
+                return;
+            const QString item_id = item.value("id").toString();
+            const QString call_id =
+                item.value("call_id").toString(item.value("id").toString());
+            const QString name = item.value("name").toString();
+            if (!item_id.isEmpty() && !call_id.isEmpty() && !name.isEmpty())
+                tool_meta.insert(item_id, qMakePair(call_id, name));
+            return;
+        }
+
+        if (event_name == "response.function_call_arguments.delta") {
+            const QString item_id = json.value("item_id").toString();
+            if (!item_id.isEmpty())
+                tool_args[item_id] += json.value("delta").toString();
+            return;
+        }
+
+        if (event_name == "response.function_call_arguments.done") {
+            const QString item_id = json.value("item_id").toString();
+            if (!item_id.isEmpty())
+                tool_args[item_id] = json.value("arguments").toString();
+            return;
+        }
+
+        if (event_name == "response.output_item.done") {
+            const QJsonObject item = json.value("item").toObject();
+            if (item.value("type").toString() != "function_call")
+                return;
+
+            CodexToolCall tool_call;
+            tool_call.id = item.value("call_id").toString(item.value("id").toString());
+            tool_call.name = item.value("name").toString();
+            const QString args = item.value("arguments").toString("{}");
+            const auto args_doc = QJsonDocument::fromJson(args.toUtf8());
+            if (args_doc.isObject())
+                tool_call.input = args_doc.object();
+            if (!tool_call.id.isEmpty() && !tool_call.name.isEmpty())
+                fallback_tool_calls.append(tool_call);
+            return;
+        }
+
+        if (event_name == "response.completed")
+            completed_response = json.value("response").toObject();
+    };
+
+    const QStringList lines = QString::fromUtf8(body).split('\n');
+    for (QString line : lines) {
+        if (line.endsWith('\r'))
+            line.chop(1);
+        if (line.isEmpty()) {
+            if (!current_event.isEmpty() && !current_data.trimmed().isEmpty() && current_data.trimmed() != "[DONE]")
+                handle_event(current_event, current_data.trimmed());
+            current_event.clear();
+            current_data.clear();
+            continue;
+        }
+        if (line.startsWith(':'))
+            continue;
+        if (line.startsWith("event:")) {
+            current_event = line.mid(6).trimmed();
+            continue;
+        }
+        if (line.startsWith("data:")) {
+            if (!current_data.isEmpty())
+                current_data += '\n';
+            current_data += line.mid(5).trimmed();
+        }
+    }
+    if (!current_event.isEmpty() && !current_data.trimmed().isEmpty() && current_data.trimmed() != "[DONE]")
+        handle_event(current_event, current_data.trimmed());
+
+    QString final_text;
+    QVector<CodexToolCall> tool_calls;
+
+    const QJsonArray output = completed_response.value("output").toArray();
+    for (const auto& item_value : output) {
+        const QJsonObject item = item_value.toObject();
+        const QString item_type = item.value("type").toString();
+        if (item_type == "message") {
+            const QJsonArray content = item.value("content").toArray();
+            for (const auto& part_value : content) {
+                const QJsonObject part = part_value.toObject();
+                const QString part_type = part.value("type").toString();
+                if (part_type == "output_text" || part_type == "refusal")
+                    final_text += part.value("text").toString();
+                if (part_type == "refusal" && final_text.isEmpty())
+                    final_text += part.value("refusal").toString();
+            }
+        } else if (item_type == "function_call") {
+            CodexToolCall tool_call;
+            tool_call.id = item.value("call_id").toString(item.value("id").toString());
+            tool_call.name = item.value("name").toString();
+            const QString args = item.value("arguments").toString("{}");
+            const auto args_doc = QJsonDocument::fromJson(args.toUtf8());
+            if (args_doc.isObject())
+                tool_call.input = args_doc.object();
+            if (!tool_call.id.isEmpty() && !tool_call.name.isEmpty())
+                tool_calls.append(tool_call);
+        }
+    }
+
+    if (tool_calls.isEmpty() && !fallback_tool_calls.isEmpty())
+        tool_calls = fallback_tool_calls;
+    if (tool_calls.isEmpty()) {
+        for (auto it = tool_meta.constBegin(); it != tool_meta.constEnd(); ++it) {
+            const QString args = tool_args.value(it.key(), "{}");
+            const auto args_doc = QJsonDocument::fromJson(args.toUtf8());
+            CodexToolCall tool_call;
+            tool_call.id = it.value().first;
+            tool_call.name = it.value().second;
+            if (args_doc.isObject())
+                tool_call.input = args_doc.object();
+            if (!tool_call.id.isEmpty() && !tool_call.name.isEmpty())
+                tool_calls.append(tool_call);
+        }
+    }
+
+    if (final_text.isEmpty())
+        final_text = text_accum;
+
+    const QJsonObject usage = completed_response.value("usage").toObject();
+    parsed.text = final_text;
+    parsed.tool_calls = tool_calls;
+    parsed.prompt_tokens = usage.value("input_tokens").toInt();
+    parsed.completion_tokens = usage.value("output_tokens").toInt();
+    parsed.total_tokens = parsed.prompt_tokens + parsed.completion_tokens;
+    if (parsed.text.isEmpty() && parsed.tool_calls.isEmpty()) {
+        parsed.success = false;
+        parsed.error = "Codex SSE stream returned no text or tool calls";
+    }
+    return parsed;
+}
+
 // ============================================================================
 // Token usage
 // ============================================================================
@@ -1741,6 +2600,27 @@ void LlmService::fetch_models(const QString& provider, const QString& api_key, c
         return;
     }
 
+    if (provider.toLower() == CODEX_PROVIDER) {
+        QPointer<LlmService> self = this;
+        QtConcurrent::run([self, provider]() {
+            QString error;
+            const auto auth = resolve_codex_auth_context(false);
+            if (auth.is_err())
+                error = QString::fromStdString(auth.error());
+            const QStringList models = {"gpt-5.3-codex"};
+            if (self) {
+                QMetaObject::invokeMethod(
+                    self,
+                    [self, provider, models, error]() {
+                        if (self)
+                            emit self->models_fetched(provider, models, error);
+                    },
+                    Qt::QueuedConnection);
+            }
+        });
+        return;
+    }
+
     QString url = get_models_url(provider, api_key, base_url);
     if (url.isEmpty()) {
         emit models_fetched(provider, {}, "Unknown provider: " + provider);
@@ -1814,7 +2694,7 @@ LlmResponse LlmService::chat(const QString& user_message, const std::vector<Conv
         return LlmResponse{.error = "No LLM provider configured"};
 
     // Take config snapshot — release lock before blocking network call
-    QString p = provider_, k = api_key_, b = base_url_, m = model_, sp = system_prompt_;
+    QString p = provider_, k = api_key_, b = base_url_, m = model_, sp = system_prompt_, effort = reasoning_effort_;
     double t = temperature_;
     int mx = max_tokens_;
     const bool saved_tools = tools_enabled_;
@@ -1828,6 +2708,7 @@ LlmResponse LlmService::chat(const QString& user_message, const std::vector<Conv
     base_url_ = b;
     model_ = m;
     system_prompt_ = sp;
+    reasoning_effort_ = effort;
     temperature_ = t;
     max_tokens_ = mx;
 
@@ -1846,7 +2727,7 @@ LlmResponse LlmService::chat(const QString& user_message, const std::vector<Conv
 void LlmService::chat_streaming(const QString& user_message, const std::vector<ConversationMessage>& history,
                                 StreamCallback on_chunk, bool use_tools) {
     // Snapshot config under lock
-    QString p, k, b, m, sp;
+    QString p, k, b, m, sp, effort;
     double t;
     int mx;
     bool saved_tools;
@@ -1858,6 +2739,7 @@ void LlmService::chat_streaming(const QString& user_message, const std::vector<C
         b = base_url_;
         m = model_;
         sp = system_prompt_;
+        effort = reasoning_effort_;
         t = temperature_;
         mx = max_tokens_;
         saved_tools = tools_enabled_;
@@ -1915,7 +2797,7 @@ void LlmService::chat_streaming(const QString& user_message, const std::vector<C
         }
     };
     QtConcurrent::run(
-        [self, p, k, b, m, sp, t, mx, user_message, history_copy, guarded_chunk, use_tools, saved_tools]() {
+        [self, p, k, b, m, sp, effort, t, mx, user_message, history_copy, guarded_chunk, use_tools, saved_tools]() {
             if (!self)
                 return;
 
@@ -1929,6 +2811,7 @@ void LlmService::chat_streaming(const QString& user_message, const std::vector<C
                 self->base_url_ = b;
                 self->model_ = m;
                 self->system_prompt_ = sp;
+                self->reasoning_effort_ = effort;
                 self->temperature_ = t;
                 self->max_tokens_ = mx;
                 // Disable tools for this request if caller requested it

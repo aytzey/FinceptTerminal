@@ -27,13 +27,19 @@ namespace fincept::screens {
 
 static constexpr const char* TAG = "LlmConfigSection";
 
-const QStringList LlmConfigSection::KNOWN_PROVIDERS = {"openai",     "anthropic", "gemini", "groq",   "deepseek",
-                                                       "openrouter", "minimax",   "ollama", "fincept"};
+const QStringList LlmConfigSection::PROVIDER_CHOICES = {"openai",       "openai-codex", "anthropic", "gemini",
+                                                        "groq",         "deepseek",      "openrouter", "minimax",
+                                                        "ollama",       "fincept"};
+const QStringList LlmConfigSection::PROFILE_PROVIDERS = {"openai",     "anthropic", "gemini", "groq",   "deepseek",
+                                                         "openrouter", "minimax",   "ollama", "fincept"};
+const QStringList LlmConfigSection::REASONING_EFFORTS = {"low", "medium", "high"};
 
 QString LlmConfigSection::default_base_url(const QString& provider) {
     const QString p = provider.toLower();
     if (p == "openai")
         return {}; // uses default
+    if (p == "openai-codex")
+        return "https://chatgpt.com/backend-api/codex";
     if (p == "anthropic")
         return {};
     if (p == "gemini")
@@ -57,6 +63,8 @@ QStringList LlmConfigSection::fallback_models(const QString& provider) {
     const QString p = provider.toLower();
     if (p == "openai")
         return {"gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "o3-mini"};
+    if (p == "openai-codex")
+        return {"gpt-5.3-codex"};
     if (p == "anthropic")
         return {"claude-sonnet-4-5-20250514", "claude-opus-4-5", "claude-3-5-sonnet-20241022",
                 "claude-3-haiku-20240307"};
@@ -198,7 +206,7 @@ QWidget* LlmConfigSection::build_provider_list_panel() {
                             QString(ui::colors::BG_RAISED()) + ";}");
     connect(add_btn_, &QPushButton::clicked, this, [this]() {
         // Show input dialog to pick provider
-        QStringList choices = KNOWN_PROVIDERS;
+        QStringList choices = PROVIDER_CHOICES;
         bool ok;
         QString provider = QInputDialog::getItem(this, "Add Provider", "Select provider:", choices, 0, false, &ok);
         if (!ok || provider.isEmpty())
@@ -366,6 +374,32 @@ QWidget* LlmConfigSection::build_form_panel() {
 
     form->addRow(m_lbl, model_row);
 
+    auto* e_lbl = new QLabel("Reasoning Effort");
+    lbl_style(e_lbl);
+    reasoning_effort_combo_ = new QComboBox;
+    reasoning_effort_combo_->addItems(REASONING_EFFORTS);
+    reasoning_effort_combo_->setMinimumWidth(160);
+    reasoning_effort_combo_->setStyleSheet("QComboBox{background:" + QString(ui::colors::BG_RAISED()) +
+                                           ";color:" + QString(ui::colors::TEXT_PRIMARY()) +
+                                           ";border:1px solid " + QString(ui::colors::BORDER_MED()) +
+                                           ";border-radius:3px;padding:6px;}"
+                                           "QComboBox:focus{border:1px solid " +
+                                           QString(ui::colors::AMBER()) +
+                                           ";}"
+                                           "QComboBox::drop-down{border:none;width:20px;}"
+                                           "QComboBox::down-arrow{image:none;border-left:4px solid transparent;"
+                                           "border-right:4px solid transparent;border-top:5px solid " +
+                                           QString(ui::colors::TEXT_SECONDARY()) +
+                                           ";}"
+                                           "QComboBox QAbstractItemView{background:" +
+                                           QString(ui::colors::BG_RAISED()) + ";color:" +
+                                           QString(ui::colors::TEXT_PRIMARY()) + ";selection-background-color:" +
+                                           QString(ui::colors::BG_RAISED()) + ";selection-color:" +
+                                           QString(ui::colors::AMBER()) + ";border:1px solid " +
+                                           QString(ui::colors::BORDER_MED()) + ";}");
+    reasoning_effort_combo_->setCurrentText("medium");
+    form->addRow(e_lbl, reasoning_effort_combo_);
+
     auto* b_lbl = new QLabel("Base URL");
     lbl_style(b_lbl);
     base_url_edit_ = new QLineEdit;
@@ -526,11 +560,20 @@ void LlmConfigSection::load_providers() {
     provider_list_->blockSignals(true);
     provider_list_->clear();
 
+    auto display_name = [](const QString& provider) {
+        const QString lower = provider.toLower();
+        if (lower == "fincept")
+            return QStringLiteral("Fincept LLM");
+        if (lower == "openai-codex")
+            return QStringLiteral("OpenAI Codex OAuth");
+        return provider;
+    };
+
     auto result = LlmConfigRepository::instance().list_providers();
     if (result.is_ok()) {
         for (const auto& p : result.value()) {
             bool is_fincept = (p.provider.toLower() == "fincept");
-            QString display = is_fincept ? "Fincept LLM" : p.provider;
+            QString display = display_name(p.provider);
             if (p.is_active)
                 display += "  ✓";
             // Show model tag only for non-fincept providers
@@ -566,6 +609,7 @@ void LlmConfigSection::populate_form(const QString& provider) {
     provider_edit_->setText(provider);
 
     bool is_fincept = (provider.toLower() == "fincept");
+    bool is_codex = (provider.toLower() == "openai-codex");
 
     // Populate model combo with fallback suggestions
     model_combo_->blockSignals(true);
@@ -595,6 +639,9 @@ void LlmConfigSection::populate_form(const QString& provider) {
             // Tools toggle — always visible
             tools_check_->setChecked(p.tools_enabled);
             tools_check_->setVisible(true);
+            reasoning_effort_combo_->setCurrentText(
+                p.reasoning_effort.isEmpty() ? QStringLiteral("medium") : p.reasoning_effort.toLower());
+            reasoning_effort_combo_->setEnabled(is_codex);
 
             if (is_fincept) {
                 api_key_edit_->clear();
@@ -608,14 +655,27 @@ void LlmConfigSection::populate_form(const QString& provider) {
                 api_key_edit_->setEnabled(false);
                 // Fincept is a managed service — hide model/base_url/fetch
                 model_combo_->setVisible(false);
+                reasoning_effort_combo_->setEnabled(false);
                 fetch_btn_->setVisible(false);
                 base_url_edit_->setVisible(false);
+            } else if (is_codex) {
+                api_key_edit_->clear();
+                api_key_edit_->setEnabled(false);
+                api_key_edit_->setPlaceholderText("Uses ~/.codex/auth.json (ChatGPT/Codex OAuth)");
+                model_combo_->setVisible(true);
+                model_combo_->setEnabled(true);
+                reasoning_effort_combo_->setEnabled(true);
+                fetch_btn_->setVisible(true);
+                fetch_btn_->setEnabled(true);
+                base_url_edit_->setVisible(true);
+                base_url_edit_->setEnabled(true);
             } else {
                 api_key_edit_->setText(p.api_key);
                 api_key_edit_->setEnabled(true);
                 api_key_edit_->setPlaceholderText("sk-...");
                 model_combo_->setVisible(true);
                 model_combo_->setEnabled(true);
+                reasoning_effort_combo_->setEnabled(false);
                 fetch_btn_->setVisible(true);
                 fetch_btn_->setEnabled(true);
                 base_url_edit_->setVisible(true);
@@ -627,7 +687,7 @@ void LlmConfigSection::populate_form(const QString& provider) {
 
     // New provider — clear form
     api_key_edit_->clear();
-    api_key_edit_->setEnabled(!is_fincept);
+    api_key_edit_->setEnabled(!is_fincept && !is_codex);
     if (is_fincept) {
         auto stored = SettingsRepository::instance().get("fincept_api_key");
         if (stored.is_ok() && !stored.value().isEmpty())
@@ -635,11 +695,24 @@ void LlmConfigSection::populate_form(const QString& provider) {
         else
             api_key_edit_->setPlaceholderText("Login to your Fincept account to enable");
         model_combo_->setVisible(false);
+        reasoning_effort_combo_->setEnabled(false);
         fetch_btn_->setVisible(false);
         base_url_edit_->setVisible(false);
+    } else if (is_codex) {
+        api_key_edit_->setPlaceholderText("Uses ~/.codex/auth.json (ChatGPT/Codex OAuth)");
+        model_combo_->setVisible(true);
+        model_combo_->setEnabled(true);
+        reasoning_effort_combo_->setEnabled(true);
+        reasoning_effort_combo_->setCurrentText("medium");
+        fetch_btn_->setVisible(true);
+        fetch_btn_->setEnabled(true);
+        base_url_edit_->setVisible(true);
+        base_url_edit_->setEnabled(true);
+        base_url_edit_->setText(def_url);
     } else {
         model_combo_->setVisible(true);
         model_combo_->setEnabled(true);
+        reasoning_effort_combo_->setEnabled(false);
         fetch_btn_->setVisible(true);
         fetch_btn_->setEnabled(true);
         base_url_edit_->setVisible(true);
@@ -671,12 +744,14 @@ void LlmConfigSection::on_save_provider() {
     }
 
     bool is_fincept = (provider == "fincept");
+    bool is_codex = (provider == "openai-codex");
 
     LlmConfig cfg;
     cfg.provider = provider;
-    cfg.api_key = is_fincept ? QString() : api_key_edit_->text().trimmed();
+    cfg.api_key = (is_fincept || is_codex) ? QString() : api_key_edit_->text().trimmed();
     cfg.model = model_combo_->currentText().trimmed();
     cfg.base_url = base_url_edit_->text().trimmed();
+    cfg.reasoning_effort = reasoning_effort_combo_->currentText().trimmed().toLower();
     cfg.is_active = true;
     cfg.tools_enabled = tools_check_->isChecked();
 
@@ -687,8 +762,15 @@ void LlmConfigSection::on_save_provider() {
         cfg.base_url = {}; // not used for fincept
     }
 
+    if (is_codex) {
+        if (cfg.model.isEmpty())
+            cfg.model = "gpt-5.3-codex";
+        if (cfg.reasoning_effort.isEmpty())
+            cfg.reasoning_effort = "medium";
+    }
+
     // Basic validation
-    if (!is_fincept && provider != "ollama" && cfg.api_key.isEmpty()) {
+    if (!is_fincept && !is_codex && provider != "ollama" && cfg.api_key.isEmpty()) {
         show_status("API key is required for " + provider, true);
         return;
     }
@@ -769,7 +851,7 @@ void LlmConfigSection::on_test_connection() {
         return;
     }
 
-    if (provider != "ollama") {
+    if (provider != "ollama" && provider != "openai-codex") {
         if (api_key_edit_->text().trimmed().isEmpty()) {
             show_status("API key required for test", true);
             return;
@@ -811,7 +893,7 @@ void LlmConfigSection::on_fetch_models() {
         return;
     }
 
-    if (provider != "ollama") {
+    if (provider != "ollama" && provider != "openai-codex") {
         if (api_key_edit_->text().trimmed().isEmpty()) {
             show_status("Enter API key first, then fetch models", true);
             return;
@@ -989,7 +1071,7 @@ QWidget* LlmConfigSection::build_profile_form_panel() {
 
     vl->addWidget(lbl("PROVIDER"));
     profile_provider_combo_ = new QComboBox;
-    profile_provider_combo_->addItems(KNOWN_PROVIDERS);
+    profile_provider_combo_->addItems(PROFILE_PROVIDERS);
     profile_provider_combo_->setStyleSheet(
         QString("QComboBox{%1}QComboBox::drop-down{border:none;}").arg(field_style()));
     connect(profile_provider_combo_, &QComboBox::currentTextChanged, this,

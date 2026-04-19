@@ -455,6 +455,7 @@ set(STORAGE_SOURCES
     src/storage/sqlite/migrations/v016_broker_accounts.cpp
     src/storage/sqlite/migrations/v017_perf_indexes.cpp
     src/storage/sqlite/migrations/v018_widget_config.cpp
+    src/storage/sqlite/migrations/v019_llm_reasoning_effort.cpp
 )
 
 # Python runner
@@ -1264,6 +1265,7 @@ set_source_files_properties(
     src/storage/sqlite/migrations/v016_broker_accounts.cpp
     src/storage/sqlite/migrations/v017_perf_indexes.cpp
     src/storage/sqlite/migrations/v018_widget_config.cpp
+    src/storage/sqlite/migrations/v019_llm_reasoning_effort.cpp
     # Polymarket screen files — each defines static fmt_* helpers in same namespace
     src/screens/polymarket/PolymarketScreen.cpp
     src/screens/polymarket/PolymarketCommandBar.cpp

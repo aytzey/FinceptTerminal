@@ -8,6 +8,7 @@ struct LlmConfig {
     QString api_key;
     QString base_url;
     QString model;
+    QString reasoning_effort = "medium";
     bool is_active = false;
     bool tools_enabled = true;
     QString created_at;

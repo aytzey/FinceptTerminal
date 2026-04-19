@@ -151,14 +151,21 @@ QJsonObject AgentService::build_payload(const QString& action, const QJsonObject
         } else {
             auto& llm = ai_chat::LlmService::instance();
             if (llm.is_configured()) {
-                QJsonObject active_llm;
-                active_llm["provider"] = llm.active_provider();
-                active_llm["model_id"] = llm.active_model();
-                active_llm["api_key"] = llm.active_api_key();
-                active_llm["base_url"] = llm.active_base_url();
-                active_llm["temperature"] = llm.active_temperature();
-                active_llm["max_tokens"] = llm.active_max_tokens();
-                payload["active_llm"] = active_llm;
+                const QString provider = llm.active_provider();
+                if (provider == "openai-codex") {
+                    LOG_WARN("AgentService",
+                             "Skipping active_llm injection for openai-codex; Python agent runtime is not wired to "
+                             "the ChatGPT Codex backend yet");
+                } else {
+                    QJsonObject active_llm;
+                    active_llm["provider"] = provider;
+                    active_llm["model_id"] = llm.active_model();
+                    active_llm["api_key"] = llm.active_api_key();
+                    active_llm["base_url"] = llm.active_base_url();
+                    active_llm["temperature"] = llm.active_temperature();
+                    active_llm["max_tokens"] = llm.active_max_tokens();
+                    payload["active_llm"] = active_llm;
+                }
             }
         }
     }

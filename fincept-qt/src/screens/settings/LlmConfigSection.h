@@ -60,6 +60,7 @@ class LlmConfigSection : public QWidget {
     QLineEdit* api_key_edit_ = nullptr;
     QLineEdit* base_url_edit_ = nullptr;
     QComboBox* model_combo_ = nullptr;
+    QComboBox* reasoning_effort_combo_ = nullptr;
     QPushButton* fetch_btn_ = nullptr;
     QPushButton* save_btn_ = nullptr;
     QPushButton* test_btn_ = nullptr;
@@ -111,7 +112,9 @@ class LlmConfigSection : public QWidget {
     void clear_profile_form();
     void show_profile_status(const QString& msg, bool error = false);
 
-    static const QStringList KNOWN_PROVIDERS;
+    static const QStringList PROVIDER_CHOICES;
+    static const QStringList PROFILE_PROVIDERS;
+    static const QStringList REASONING_EFFORTS;
     static QString default_base_url(const QString& provider);
     static QStringList fallback_models(const QString& provider);
 };
