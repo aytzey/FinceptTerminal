@@ -2,9 +2,13 @@
 #include "services/forum/ForumService.h"
 
 #include "auth/AuthManager.h"
+#include "core/config/AppPaths.h"
 #include "core/logging/Logger.h"
 #include "storage/cache/CacheManager.h"
 
+#include <QDateTime>
+#include <QDir>
+#include <QFile>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -12,6 +16,9 @@
 #include <QNetworkRequest>
 #include <QUrl>
 #include <QUrlQuery>
+#include <QUuid>
+
+#include <algorithm>
 
 static constexpr int kCategoriesTtlSec  = 5 * 60;
 static constexpr int kStatsTtlSec       = 2 * 60;
@@ -19,6 +26,510 @@ static constexpr int kTrendingTtlSec    = 2 * 60;
 static constexpr int kTransferTimeoutMs = 10000; // 10s per API request
 
 namespace fincept::services {
+namespace {
+
+bool local_forum_enabled() {
+    const auto& auth = auth::AuthManager::instance();
+    return auth.has_local_runtime() || !auth.has_fincept_api_key();
+}
+
+QString local_store_path() {
+    return fincept::AppPaths::data() + "/forum_local.json";
+}
+
+QString now_iso() {
+    return QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+}
+
+QJsonObject default_profile_object() {
+    const auto& session = auth::AuthManager::instance().session();
+    const QString username = session.user_info.username.isEmpty() ? QStringLiteral("local_user") : session.user_info.username;
+    const QString email = session.user_info.email;
+    return QJsonObject{{"user_id", session.user_info.id},
+                       {"username", username},
+                       {"display_name", username == "local_user" ? QStringLiteral("Local User") : username},
+                       {"bio", QStringLiteral("Local Fincept forum profile")},
+                       {"avatar_color", QStringLiteral("#d97706")},
+                       {"signature", QString()},
+                       {"reputation", 0},
+                       {"posts_count", 0},
+                       {"comments_count", 0},
+                       {"likes_received", 0},
+                       {"likes_given", 0},
+                       {"email", email},
+                       {"created_at", now_iso()},
+                       {"last_active_at", now_iso()}};
+}
+
+QJsonArray default_categories() {
+    const QString created = now_iso();
+    return QJsonArray{
+        QJsonObject{{"id", 1},
+                    {"name", "Markets"},
+                    {"description", "Market structure, macro, flows, news and trade ideas"},
+                    {"color", "#16a34a"},
+                    {"post_count", 0},
+                    {"display_order", 1},
+                    {"created_at", created}},
+        QJsonObject{{"id", 2},
+                    {"name", "Research"},
+                    {"description", "Equity research, quant workflows, valuation and portfolio notes"},
+                    {"color", "#0891b2"},
+                    {"post_count", 0},
+                    {"display_order", 2},
+                    {"created_at", created}},
+        QJsonObject{{"id", 3},
+                    {"name", "Terminal"},
+                    {"description", "Local setup, Codex workflows, data sources and product feedback"},
+                    {"color", "#d97706"},
+                    {"post_count", 0},
+                    {"display_order", 3},
+                    {"created_at", created}},
+    };
+}
+
+QJsonObject load_local_store() {
+    QDir().mkpath(fincept::AppPaths::data());
+    QFile file(local_store_path());
+    if (file.open(QIODevice::ReadOnly)) {
+        const QJsonObject existing = QJsonDocument::fromJson(file.readAll()).object();
+        if (!existing.isEmpty()) {
+            QJsonObject store = existing;
+            if (!store.value("categories").isArray())
+                store["categories"] = default_categories();
+            if (!store.value("posts").isArray())
+                store["posts"] = QJsonArray{};
+            if (!store.value("comments").isArray())
+                store["comments"] = QJsonArray{};
+            if (!store.value("profile").isObject())
+                store["profile"] = default_profile_object();
+            if (store.value("next_post_id").toInt() <= 0)
+                store["next_post_id"] = store.value("posts").toArray().size() + 1;
+            if (store.value("next_comment_id").toInt() <= 0)
+                store["next_comment_id"] = store.value("comments").toArray().size() + 1;
+            return store;
+        }
+    }
+
+    return QJsonObject{{"schema", 1},
+                       {"categories", default_categories()},
+                       {"posts", QJsonArray{}},
+                       {"comments", QJsonArray{}},
+                       {"profile", default_profile_object()},
+                       {"next_post_id", 1},
+                       {"next_comment_id", 1}};
+}
+
+bool save_local_store(const QJsonObject& store) {
+    QDir().mkpath(fincept::AppPaths::data());
+    QFile file(local_store_path());
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        return false;
+    file.write(QJsonDocument(store).toJson(QJsonDocument::Indented));
+    return true;
+}
+
+QJsonObject category_by_id(const QJsonObject& store, int category_id) {
+    for (const auto& value : store.value("categories").toArray()) {
+        const QJsonObject category = value.toObject();
+        if (category.value("id").toInt() == category_id)
+            return category;
+    }
+    return {};
+}
+
+QJsonArray comments_for_post(const QJsonObject& store, const QString& post_uuid) {
+    QJsonArray out;
+    for (const auto& value : store.value("comments").toArray()) {
+        const QJsonObject comment = value.toObject();
+        if (comment.value("post_uuid").toString() == post_uuid)
+            out.append(comment);
+    }
+    return out;
+}
+
+QJsonObject post_with_derived_fields(const QJsonObject& store, QJsonObject post) {
+    const QJsonObject category = category_by_id(store, post.value("category_id").toInt());
+    post["category_name"] = category.value("name").toString();
+    post["category_color"] = category.value("color").toString();
+    post["reply_count"] = comments_for_post(store, post.value("post_uuid").toString()).size();
+    return post;
+}
+
+QJsonArray categories_with_counts(const QJsonObject& store) {
+    QJsonArray categories;
+    const QJsonArray posts = store.value("posts").toArray();
+    for (const auto& value : store.value("categories").toArray()) {
+        QJsonObject category = value.toObject();
+        int count = 0;
+        const int id = category.value("id").toInt();
+        for (const auto& post_value : posts) {
+            if (post_value.toObject().value("category_id").toInt() == id)
+                ++count;
+        }
+        category["post_count"] = count;
+        categories.append(category);
+    }
+    return categories;
+}
+
+QJsonObject permissions_object() {
+    return QJsonObject{{"can_create_posts", true}, {"can_vote", true}, {"can_comment", true}};
+}
+
+QVector<QJsonObject> filtered_posts(const QJsonObject& store, int category_id, const QString& query = {}) {
+    QVector<QJsonObject> posts;
+    const QString q = query.toLower().trimmed();
+    for (const auto& value : store.value("posts").toArray()) {
+        QJsonObject post = post_with_derived_fields(store, value.toObject());
+        if (category_id > 0 && post.value("category_id").toInt() != category_id)
+            continue;
+        if (!q.isEmpty()) {
+            const QString haystack = (post.value("title").toString() + " " + post.value("content").toString() + " "
+                                      + post.value("category_name").toString())
+                                         .toLower();
+            if (!haystack.contains(q))
+                continue;
+        }
+        posts.append(post);
+    }
+    return posts;
+}
+
+QJsonObject posts_page_object(const QJsonObject& store, QVector<QJsonObject> posts, int category_id, int page,
+                              const QString& sort) {
+    const QString sort_by = sort.isEmpty() ? QStringLiteral("latest") : sort;
+    std::sort(posts.begin(), posts.end(), [sort_by](const QJsonObject& a, const QJsonObject& b) {
+        if (sort_by == "top") {
+            const int as = a.value("likes").toInt() + a.value("reply_count").toInt();
+            const int bs = b.value("likes").toInt() + b.value("reply_count").toInt();
+            if (as != bs)
+                return as > bs;
+        }
+        return a.value("created_at").toString() > b.value("created_at").toString();
+    });
+
+    const int limit = 20;
+    page = std::max(1, page);
+    const int total = posts.size();
+    const int pages = std::max(1, (total + limit - 1) / limit);
+    const int start = (page - 1) * limit;
+    QJsonArray arr;
+    for (int i = start; i < std::min(start + limit, total); ++i)
+        arr.append(posts[i]);
+
+    return QJsonObject{{"posts", arr},
+                       {"pagination", QJsonObject{{"page", page}, {"limit", limit}, {"total", total}, {"pages", pages}}},
+                       {"sort_by", sort_by},
+                       {"category", category_by_id(store, category_id)}};
+}
+
+QJsonObject profile_envelope(const QJsonObject& store, const QString& requested_username = {}) {
+    QJsonObject profile = store.value("profile").toObject(default_profile_object());
+    const QString username = profile.value("username").toString("local_user");
+    if (!requested_username.isEmpty() && requested_username.compare(username, Qt::CaseInsensitive) != 0)
+        return {};
+
+    int posts_count = 0;
+    int comments_count = 0;
+    int likes_received = 0;
+    QJsonArray recent_posts;
+    QVector<QJsonObject> own_posts = filtered_posts(store, 0);
+    for (const auto& post : own_posts) {
+        if (post.value("author_name").toString() == username) {
+            ++posts_count;
+            likes_received += post.value("likes").toInt();
+            if (recent_posts.size() < 5)
+                recent_posts.append(post);
+        }
+    }
+    for (const auto& value : store.value("comments").toArray()) {
+        const QJsonObject comment = value.toObject();
+        if (comment.value("author_name").toString() == username) {
+            ++comments_count;
+            likes_received += comment.value("likes").toInt();
+        }
+    }
+    profile["posts_count"] = posts_count;
+    profile["comments_count"] = comments_count;
+    profile["likes_received"] = likes_received;
+    profile["reputation"] = likes_received + posts_count * 2 + comments_count;
+    profile["last_active_at"] = now_iso();
+    return QJsonObject{{"profile", profile}, {"recent_posts", recent_posts}, {"is_own_profile", true}};
+}
+
+QJsonObject stats_object(const QJsonObject& store) {
+    const QJsonArray categories = categories_with_counts(store);
+    const QJsonArray posts = store.value("posts").toArray();
+    const QJsonArray comments = store.value("comments").toArray();
+    int votes = 0;
+    for (const auto& value : posts) {
+        if (!value.toObject().value("user_vote").toString().isEmpty())
+            ++votes;
+    }
+    for (const auto& value : comments) {
+        if (!value.toObject().value("user_vote").toString().isEmpty())
+            ++votes;
+    }
+    QJsonObject profile = profile_envelope(store).value("profile").toObject();
+    return QJsonObject{{"total_categories", categories.size()},
+                       {"total_posts", posts.size()},
+                       {"total_comments", comments.size()},
+                       {"total_votes", votes},
+                       {"recent_posts_24h", posts.size()},
+                       {"popular_categories", categories},
+                       {"top_contributors",
+                        QJsonArray{QJsonObject{{"display_name", profile.value("display_name").toString()},
+                                               {"username", profile.value("username").toString()},
+                                               {"reputation", profile.value("reputation").toInt()},
+                                               {"posts_count", profile.value("posts_count").toInt()}}}}};
+}
+
+bool local_get(const QString& path, QJsonObject& data, QString& error) {
+    QJsonObject store = load_local_store();
+    QUrl url(QStringLiteral("local://forum") + path);
+    const QString route = url.path();
+    const QStringList parts = route.split('/', Qt::SkipEmptyParts);
+    QUrlQuery query(url);
+
+    if (route == "/forum/categories") {
+        data = QJsonObject{{"categories", categories_with_counts(store)}, {"permissions", permissions_object()}};
+        return true;
+    }
+    if (route == "/forum/stats") {
+        data = stats_object(store);
+        return true;
+    }
+    if (route == "/forum/posts/trending") {
+        QVector<QJsonObject> posts = filtered_posts(store, 0);
+        std::sort(posts.begin(), posts.end(), [](const QJsonObject& a, const QJsonObject& b) {
+            const int as = a.value("likes").toInt() + a.value("reply_count").toInt() + a.value("views").toInt();
+            const int bs = b.value("likes").toInt() + b.value("reply_count").toInt() + b.value("views").toInt();
+            return as > bs;
+        });
+        QJsonArray arr;
+        for (int i = 0; i < std::min(20, static_cast<int>(posts.size())); ++i)
+            arr.append(posts[i]);
+        data = QJsonObject{{"trending_posts", arr}, {"total", posts.size()}};
+        return true;
+    }
+    if (route == "/forum/search") {
+        const QString q = query.queryItemValue("q");
+        const int page = query.queryItemValue("page").toInt();
+        const auto page_obj = posts_page_object(store, filtered_posts(store, 0, q), 0, page, "latest");
+        data = QJsonObject{{"results",
+                            QJsonObject{{"posts", page_obj.value("posts").toArray()},
+                                        {"total_results",
+                                         page_obj.value("pagination").toObject().value("total").toInt()}}},
+                           {"pagination", page_obj.value("pagination").toObject()}};
+        return true;
+    }
+    if (route == "/forum/profile") {
+        data = profile_envelope(store);
+        return true;
+    }
+    if (parts.size() == 3 && parts[0] == "forum" && parts[1] == "profile") {
+        data = profile_envelope(store, parts[2]);
+        if (data.isEmpty()) {
+            error = "Local forum profile not found";
+            return false;
+        }
+        return true;
+    }
+    if (parts.size() == 4 && parts[0] == "forum" && parts[1] == "categories" && parts[3] == "posts") {
+        const int category_id = parts[2].toInt();
+        const int page = query.queryItemValue("page").toInt();
+        const QString sort = query.queryItemValue("sort");
+        data = posts_page_object(store, filtered_posts(store, category_id), category_id, page, sort);
+        return true;
+    }
+    if (parts.size() == 3 && parts[0] == "forum" && parts[1] == "posts") {
+        const QString uuid = parts[2];
+        QJsonArray posts = store.value("posts").toArray();
+        for (int i = 0; i < posts.size(); ++i) {
+            QJsonObject post = posts[i].toObject();
+            if (post.value("post_uuid").toString() != uuid)
+                continue;
+            post["views"] = post.value("views").toInt() + 1;
+            posts.replace(i, post);
+            store["posts"] = posts;
+            save_local_store(store);
+            const QJsonArray comments = comments_for_post(store, uuid);
+            data = QJsonObject{{"post", post_with_derived_fields(store, post)},
+                               {"comments", comments},
+                               {"total_comments", comments.size()},
+                               {"permissions", permissions_object()}};
+            return true;
+        }
+        error = "Local forum post not found";
+        return false;
+    }
+
+    error = "Local forum route not implemented: " + path;
+    return false;
+}
+
+bool local_post(const QString& path, const QJsonObject& body, QJsonObject& data, QString& error) {
+    QJsonObject store = load_local_store();
+    const QStringList parts = path.split('/', Qt::SkipEmptyParts);
+    QJsonObject profile = profile_envelope(store).value("profile").toObject();
+    const QString username = profile.value("username").toString("local_user");
+    const QString display_name = profile.value("display_name").toString(username);
+
+    if (parts.size() == 4 && parts[0] == "forum" && parts[1] == "categories" && parts[3] == "posts") {
+        const int category_id = parts[2].toInt();
+        if (category_by_id(store, category_id).isEmpty()) {
+            error = "Local forum category not found";
+            return false;
+        }
+        QJsonArray posts = store.value("posts").toArray();
+        const int id = store.value("next_post_id").toInt(1);
+        QJsonObject post{{"id", id},
+                         {"post_uuid", QUuid::createUuid().toString(QUuid::WithoutBraces)},
+                         {"category_id", category_id},
+                         {"title", body.value("title").toString().trimmed()},
+                         {"content", body.value("content").toString().trimmed()},
+                         {"views", 0},
+                         {"likes", 0},
+                         {"reply_count", 0},
+                         {"created_at", now_iso()},
+                         {"updated_at", now_iso()},
+                         {"author_name", username},
+                         {"author_display_name", display_name},
+                         {"user_vote", QString()}};
+        posts.append(post);
+        store["posts"] = posts;
+        store["next_post_id"] = id + 1;
+        if (!save_local_store(store)) {
+            error = "Failed to save local forum store";
+            return false;
+        }
+        data = post_with_derived_fields(store, post);
+        return true;
+    }
+
+    if (parts.size() == 4 && parts[0] == "forum" && parts[1] == "posts" && parts[3] == "comments") {
+        const QString post_uuid = parts[2];
+        bool post_found = false;
+        for (const auto& value : store.value("posts").toArray()) {
+            if (value.toObject().value("post_uuid").toString() == post_uuid) {
+                post_found = true;
+                break;
+            }
+        }
+        if (!post_found) {
+            error = "Local forum post not found";
+            return false;
+        }
+        QJsonArray comments = store.value("comments").toArray();
+        const int id = store.value("next_comment_id").toInt(1);
+        QJsonObject comment{{"id", id},
+                            {"comment_uuid", QUuid::createUuid().toString(QUuid::WithoutBraces)},
+                            {"post_uuid", post_uuid},
+                            {"content", body.value("content").toString().trimmed()},
+                            {"likes", 0},
+                            {"dislikes", 0},
+                            {"created_at", now_iso()},
+                            {"author_name", username},
+                            {"author_display_name", display_name},
+                            {"parent_comment_id", 0},
+                            {"user_vote", QString()}};
+        comments.append(comment);
+        store["comments"] = comments;
+        store["next_comment_id"] = id + 1;
+        if (!save_local_store(store)) {
+            error = "Failed to save local forum store";
+            return false;
+        }
+        data = comment;
+        return true;
+    }
+
+    if (parts.size() == 4 && parts[0] == "forum" && parts[1] == "posts" && parts[3] == "vote") {
+        QJsonArray posts = store.value("posts").toArray();
+        const QString uuid = parts[2];
+        const QString vote = body.value("vote_type").toString();
+        for (int i = 0; i < posts.size(); ++i) {
+            QJsonObject post = posts[i].toObject();
+            if (post.value("post_uuid").toString() != uuid)
+                continue;
+            const QString previous = post.value("user_vote").toString();
+            int likes = post.value("likes").toInt();
+            if (previous == "up")
+                --likes;
+            if (vote == "up")
+                ++likes;
+            post["likes"] = std::max(0, likes);
+            post["user_vote"] = vote == "up" ? vote : QString();
+            post["updated_at"] = now_iso();
+            posts.replace(i, post);
+            store["posts"] = posts;
+            save_local_store(store);
+            data = post_with_derived_fields(store, post);
+            return true;
+        }
+        error = "Local forum post not found";
+        return false;
+    }
+
+    if (parts.size() == 4 && parts[0] == "forum" && parts[1] == "comments" && parts[3] == "vote") {
+        QJsonArray comments = store.value("comments").toArray();
+        const QString uuid = parts[2];
+        const QString vote = body.value("vote_type").toString();
+        for (int i = 0; i < comments.size(); ++i) {
+            QJsonObject comment = comments[i].toObject();
+            if (comment.value("comment_uuid").toString() != uuid)
+                continue;
+            const QString previous = comment.value("user_vote").toString();
+            int likes = comment.value("likes").toInt();
+            int dislikes = comment.value("dislikes").toInt();
+            if (previous == "up")
+                --likes;
+            if (previous == "down")
+                --dislikes;
+            if (vote == "up")
+                ++likes;
+            if (vote == "down")
+                ++dislikes;
+            comment["likes"] = std::max(0, likes);
+            comment["dislikes"] = std::max(0, dislikes);
+            comment["user_vote"] = (vote == "up" || vote == "down") ? vote : QString();
+            comments.replace(i, comment);
+            store["comments"] = comments;
+            save_local_store(store);
+            data = comment;
+            return true;
+        }
+        error = "Local forum comment not found";
+        return false;
+    }
+
+    error = "Local forum route not implemented: " + path;
+    return false;
+}
+
+bool local_put(const QString& path, const QJsonObject& body, QJsonObject& data, QString& error) {
+    if (path != "/forum/profile") {
+        error = "Local forum route not implemented: " + path;
+        return false;
+    }
+    QJsonObject store = load_local_store();
+    QJsonObject profile = store.value("profile").toObject(default_profile_object());
+    profile["display_name"] = body.value("display_name").toString(profile.value("display_name").toString()).trimmed();
+    profile["bio"] = body.value("bio").toString().trimmed();
+    profile["signature"] = body.value("signature").toString().trimmed();
+    profile["avatar_color"] = body.value("avatar_color").toString(profile.value("avatar_color").toString()).trimmed();
+    profile["last_active_at"] = now_iso();
+    store["profile"] = profile;
+    if (!save_local_store(store)) {
+        error = "Failed to save local forum profile";
+        return false;
+    }
+    data = profile_envelope(store);
+    return true;
+}
+
+} // namespace
 
 ForumService& ForumService::instance() {
     static ForumService s;
@@ -36,6 +547,16 @@ QString ForumService::api_key() const {
 // ── Low-level HTTP helpers ────────────────────────────────────────────────────
 
 void ForumService::get(const QString& path, std::function<void(bool, QJsonObject)> cb) {
+    if (local_forum_enabled()) {
+        QJsonObject data;
+        QString error;
+        const bool ok = local_get(path, data, error);
+        if (!ok)
+            LOG_WARN("ForumService", error);
+        cb(ok, data);
+        return;
+    }
+
     QNetworkRequest req(QUrl(QString(BASE) + path));
     req.setRawHeader("X-API-KEY", api_key().toUtf8());
     req.setRawHeader("Accept", "application/json");
@@ -61,6 +582,16 @@ void ForumService::get(const QString& path, std::function<void(bool, QJsonObject
 }
 
 void ForumService::post_req(const QString& path, const QJsonObject& body, std::function<void(bool, QJsonObject)> cb) {
+    if (local_forum_enabled()) {
+        QJsonObject data;
+        QString error;
+        const bool ok = local_post(path, body, data, error);
+        if (!ok)
+            LOG_WARN("ForumService", error);
+        cb(ok, data);
+        return;
+    }
+
     QNetworkRequest req(QUrl(QString(BASE) + path));
     req.setRawHeader("X-API-KEY", api_key().toUtf8());
     req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
@@ -81,6 +612,16 @@ void ForumService::post_req(const QString& path, const QJsonObject& body, std::f
 }
 
 void ForumService::put_req(const QString& path, const QJsonObject& body, std::function<void(bool, QJsonObject)> cb) {
+    if (local_forum_enabled()) {
+        QJsonObject data;
+        QString error;
+        const bool ok = local_put(path, body, data, error);
+        if (!ok)
+            LOG_WARN("ForumService", error);
+        cb(ok, data);
+        return;
+    }
+
     QNetworkRequest req(QUrl(QString(BASE) + path));
     req.setRawHeader("X-API-KEY", api_key().toUtf8());
     req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
@@ -194,7 +735,7 @@ ForumProfile ForumService::parse_profile(const QJsonObject& o) {
 // ── Public API ────────────────────────────────────────────────────────────────
 
 void ForumService::fetch_categories(CategoriesCallback cb) {
-    const QVariant cached = fincept::CacheManager::instance().get("forum:categories");
+    const QVariant cached = local_forum_enabled() ? QVariant{} : fincept::CacheManager::instance().get("forum:categories");
     if (!cached.isNull()) {
         auto root = QJsonDocument::fromJson(cached.toString().toUtf8()).object();
         QVector<ForumCategory> cats;
@@ -275,7 +816,7 @@ void ForumService::fetch_post(const QString& post_uuid, PostDetailCallback cb) {
 }
 
 void ForumService::fetch_stats(StatsCallback cb) {
-    const QVariant cached = fincept::CacheManager::instance().get("forum:stats");
+    const QVariant cached = local_forum_enabled() ? QVariant{} : fincept::CacheManager::instance().get("forum:stats");
     if (!cached.isNull()) {
         auto data = QJsonDocument::fromJson(cached.toString().toUtf8()).object();
         cb(true, parse_stats(data));
@@ -295,7 +836,7 @@ void ForumService::fetch_stats(StatsCallback cb) {
 }
 
 void ForumService::fetch_trending(PostsCallback cb) {
-    const QVariant cached = fincept::CacheManager::instance().get("forum:trending");
+    const QVariant cached = local_forum_enabled() ? QVariant{} : fincept::CacheManager::instance().get("forum:trending");
     if (!cached.isNull()) {
         auto data = QJsonDocument::fromJson(cached.toString().toUtf8()).object();
         ForumPostsPage result;
