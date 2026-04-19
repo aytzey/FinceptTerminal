@@ -32,8 +32,7 @@ namespace {
 static constexpr const char* LOCAL_STORE_FILE = "chat_mode_local.json";
 
 bool local_chat_mode_enabled() {
-    auto& auth = auth::AuthManager::instance();
-    return auth.has_local_runtime() || !auth.has_fincept_api_key();
+    return true;
 }
 
 QString now_iso() {
@@ -480,7 +479,8 @@ void ChatModeService::get(const QString& path, std::function<void(bool, QJsonDoc
 void ChatModeService::post(const QString& path, const QJsonObject& body,
                            std::function<void(bool, QJsonDocument, QString)> cb) {
     if (local_chat_mode_enabled()) {
-        cb(false, {}, "Local Chat Mode does not post to Fincept Cloud: " + path);
+        Q_UNUSED(body);
+        cb(false, {}, "Local Chat Mode route is not implemented: POST " + path);
         return;
     }
     auto* reply = nam_->post(build_request(path), QJsonDocument(body).toJson(QJsonDocument::Compact));
@@ -490,7 +490,8 @@ void ChatModeService::post(const QString& path, const QJsonObject& body,
 void ChatModeService::put(const QString& path, const QJsonObject& body,
                           std::function<void(bool, QJsonDocument, QString)> cb) {
     if (local_chat_mode_enabled()) {
-        cb(false, {}, "Local Chat Mode does not put to Fincept Cloud: " + path);
+        Q_UNUSED(body);
+        cb(false, {}, "Local Chat Mode route is not implemented: PUT " + path);
         return;
     }
     auto* reply = nam_->put(build_request(path), QJsonDocument(body).toJson(QJsonDocument::Compact));
@@ -499,7 +500,7 @@ void ChatModeService::put(const QString& path, const QJsonObject& body,
 
 void ChatModeService::del(const QString& path, std::function<void(bool, QJsonDocument, QString)> cb) {
     if (local_chat_mode_enabled()) {
-        cb(false, {}, "Local Chat Mode does not delete from Fincept Cloud: " + path);
+        cb(false, {}, "Local Chat Mode route is not implemented: DELETE " + path);
         return;
     }
     auto* reply = nam_->deleteResource(build_request(path));
@@ -509,7 +510,8 @@ void ChatModeService::del(const QString& path, std::function<void(bool, QJsonDoc
 void ChatModeService::del_with_body(const QString& path, const QJsonObject& body,
                                     std::function<void(bool, QJsonDocument, QString)> cb) {
     if (local_chat_mode_enabled()) {
-        cb(false, {}, "Local Chat Mode does not delete from Fincept Cloud: " + path);
+        Q_UNUSED(body);
+        cb(false, {}, "Local Chat Mode route is not implemented: DELETE " + path);
         return;
     }
     QNetworkRequest req = build_request(path);
