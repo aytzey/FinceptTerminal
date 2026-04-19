@@ -169,6 +169,14 @@ void AuthManager::initialize() {
     set_loading(true);
     load_session();
 
+    if (has_local_runtime()) {
+        clear_tokens();
+        session_.authenticated = false;
+        set_loading(false);
+        emit auth_state_changed();
+        return;
+    }
+
     if (!session_.api_key.isEmpty()) {
         // Apply api_key ONLY — do NOT send the stale session_token during
         // startup validation. The server enforces single-session via
@@ -460,7 +468,7 @@ void AuthManager::logout() {
         return;
     is_logging_out_ = true;
 
-    if (!session_.api_key.isEmpty()) {
+    if (!session_.api_key.isEmpty() && !has_local_runtime()) {
         AuthApi::instance().logout([](ApiResponse) {});
     }
 
@@ -524,6 +532,11 @@ void AuthManager::attempt_session_recovery(std::function<void(bool)> cb) {
 // ── Refresh user data ────────────────────────────────────────────────────────
 
 void AuthManager::refresh_user_data() {
+    if (has_local_runtime()) {
+        emit auth_state_changed();
+        emit subscription_fetched();
+        return;
+    }
     if (!session_.authenticated || session_.api_key.isEmpty())
         return;
     // fetch_user_profile chains into fetch_user_subscription automatically

@@ -109,31 +109,6 @@ bool local_mode_enabled() {
     return auth::AuthManager::instance().is_local_mode();
 }
 
-QWidget* make_cloud_feature_notice(const QString& title, const QString& detail) {
-    auto* panel = new QWidget;
-    panel->setStyleSheet(QString("background:%1;").arg(ui::colors::BG_BASE()));
-
-    auto* layout = new QVBoxLayout(panel);
-    layout->setContentsMargins(40, 40, 40, 40);
-    layout->setSpacing(14);
-    layout->addStretch();
-
-    auto* title_label = new QLabel(title, panel);
-    title_label->setAlignment(Qt::AlignCenter);
-    title_label->setStyleSheet(
-        QString("color:%1;font-size:24px;font-weight:700;letter-spacing:1px;").arg(ui::colors::AMBER()));
-    layout->addWidget(title_label);
-
-    auto* detail_label = new QLabel(detail, panel);
-    detail_label->setAlignment(Qt::AlignCenter);
-    detail_label->setWordWrap(true);
-    detail_label->setStyleSheet(QString("color:%1;font-size:14px;line-height:1.4;").arg(ui::colors::TEXT_SECONDARY()));
-    layout->addWidget(detail_label);
-
-    layout->addStretch();
-    return panel;
-}
-
 } // namespace
 
 MainWindow::MainWindow(int window_id, QWidget* parent) : QMainWindow(parent), window_id_(window_id) {
@@ -870,16 +845,7 @@ void MainWindow::setup_dock_screens() {
 
     // Lazily constructed on first navigation — deferred to avoid startup cost.
     dock_router_->register_factory("report_builder", []() { return new screens::ReportBuilderScreen; });
-    dock_router_->register_factory("profile", []() -> QWidget* {
-        auto& auth = auth::AuthManager::instance();
-        if (auth.is_local_mode() && !auth.has_fincept_api_key()) {
-            return make_cloud_feature_notice(
-                "PROFILE",
-                "Local Codex mode is active. Add a Fincept API key to load profile, billing, usage, and account data "
-                "without a Fincept login flow.");
-        }
-        return new screens::ProfileScreen;
-    });
+    dock_router_->register_factory("profile", []() { return new screens::ProfileScreen; });
     dock_router_->register_factory("settings", []() { return new screens::SettingsScreen; });
     dock_router_->register_factory("about", []() { return new screens::AboutScreen; });
     dock_router_->register_factory("support", []() { return new screens::SupportScreen; });

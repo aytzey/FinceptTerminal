@@ -1,20 +1,28 @@
 #include "screens/support/SupportScreen.h"
 
+#include "auth/AuthManager.h"
 #include "auth/UserApi.h"
+#include "core/config/AppPaths.h"
 #include "ui/theme/Theme.h"
 
 #include <QDateTime>
 #include <QDesktopServices>
+#include <QDir>
+#include <QFile>
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QJsonArray>
+#include <QJsonDocument>
 #include <QJsonObject>
 #include <QScrollArea>
 #include <QScrollBar>
+#include <QSaveFile>
 #include <QSplitter>
 #include <QTimer>
 #include <QUrl>
 #include <QVBoxLayout>
+
+#include <algorithm>
 
 namespace fincept::screens {
 
@@ -113,6 +121,159 @@ static QLabel* status_badge(const QString& text, const QString& bg, const QStrin
                              "padding:0 8px;letter-spacing:0.5px;%3")
                          .arg(bg, fg, MF));
     return b;
+}
+
+static bool local_support_enabled() {
+    const auto& auth = auth::AuthManager::instance();
+    return auth.has_local_runtime() || !auth.has_fincept_api_key();
+}
+
+static QString local_support_store_path() {
+    return fincept::AppPaths::data() + "/support_local.json";
+}
+
+static QJsonArray default_support_categories() {
+    return QJsonArray{"general", "bug_report", "feature_request", "billing", "data_issue", "local_runtime"};
+}
+
+static QJsonObject default_support_store() {
+    return QJsonObject{{"categories", default_support_categories()},
+                       {"tickets", QJsonArray{}},
+                       {"local_runtime", true},
+                       {"fincept_cloud_fallback", false}};
+}
+
+static bool write_local_support_store(const QJsonObject& root) {
+    QDir().mkpath(fincept::AppPaths::data());
+    QSaveFile file(local_support_store_path());
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        return false;
+    file.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+    return file.commit();
+}
+
+static QJsonObject read_local_support_store() {
+    QFile file(local_support_store_path());
+    if (!file.exists())
+        return default_support_store();
+    if (!file.open(QIODevice::ReadOnly))
+        return default_support_store();
+
+    const auto doc = QJsonDocument::fromJson(file.readAll());
+    if (!doc.isObject())
+        return default_support_store();
+
+    QJsonObject root = doc.object();
+    if (!root.value("categories").isArray())
+        root["categories"] = default_support_categories();
+    if (!root.value("tickets").isArray())
+        root["tickets"] = QJsonArray{};
+    root["local_runtime"] = true;
+    root["fincept_cloud_fallback"] = false;
+    return root;
+}
+
+static QJsonArray local_support_categories() {
+    return read_local_support_store().value("categories").toArray(default_support_categories());
+}
+
+static QJsonArray local_support_tickets() {
+    return read_local_support_store().value("tickets").toArray();
+}
+
+static int next_local_ticket_id(const QJsonArray& tickets) {
+    int max_id = 0;
+    for (const auto& v : tickets)
+        max_id = std::max(max_id, v.toObject().value("id").toInt());
+    return max_id + 1;
+}
+
+static bool create_local_support_ticket(const QString& subject, const QString& description, const QString& category,
+                                        const QString& priority) {
+    QJsonObject root = read_local_support_store();
+    QJsonArray tickets = root.value("tickets").toArray();
+    const QString now = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+    QJsonObject ticket{{"id", next_local_ticket_id(tickets)},
+                       {"subject", subject},
+                       {"description", description},
+                       {"category", category},
+                       {"priority", priority},
+                       {"status", "open"},
+                       {"created_at", now},
+                       {"updated_at", now},
+                       {"messages", QJsonArray{}}};
+    tickets.prepend(ticket);
+    root["tickets"] = tickets;
+    return write_local_support_store(root);
+}
+
+static bool append_local_support_message(int id, const QString& message) {
+    QJsonObject root = read_local_support_store();
+    QJsonArray tickets = root.value("tickets").toArray();
+    const QString now = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+    for (int i = 0; i < tickets.size(); ++i) {
+        QJsonObject ticket = tickets.at(i).toObject();
+        if (ticket.value("id").toInt() != id)
+            continue;
+        QJsonArray messages = ticket.value("messages").toArray();
+        messages.append(QJsonObject{{"sender_type", "user"}, {"message", message}, {"created_at", now}});
+        ticket["messages"] = messages;
+        ticket["updated_at"] = now;
+        tickets.replace(i, ticket);
+        root["tickets"] = tickets;
+        return write_local_support_store(root);
+    }
+    return false;
+}
+
+static bool update_local_support_status(int id, const QString& status) {
+    QJsonObject root = read_local_support_store();
+    QJsonArray tickets = root.value("tickets").toArray();
+    const QString now = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+    for (int i = 0; i < tickets.size(); ++i) {
+        QJsonObject ticket = tickets.at(i).toObject();
+        if (ticket.value("id").toInt() != id)
+            continue;
+        ticket["status"] = status;
+        ticket["updated_at"] = now;
+        tickets.replace(i, ticket);
+        root["tickets"] = tickets;
+        return write_local_support_store(root);
+    }
+    return false;
+}
+
+static void append_support_message_widget(QWidget* parent, QVBoxLayout* layout, const QJsonObject& mo) {
+    QString sender_type = mo["sender_type"].toString();
+    if (sender_type.isEmpty())
+        sender_type = mo["role"].toString();
+    if (sender_type.isEmpty())
+        sender_type = mo["type"].toString();
+    if (sender_type.isEmpty())
+        sender_type = mo["sender"].toString();
+    bool is_user = (sender_type == "user" || sender_type == "customer");
+    QString sender = is_user ? "You" : "Support Team";
+    QString bubble_color = is_user ? ui::colors::CYAN() : "#9333ea";
+
+    QString ts;
+    QDateTime mdt = QDateTime::fromString(mo["created_at"].toString(), Qt::ISODate);
+    if (mdt.isValid())
+        ts = mdt.toLocalTime().toString("d MMM yyyy  hh:mm");
+
+    auto* m = new QWidget(parent);
+    m->setStyleSheet(QString("background:%1;border:1px solid %2;border-left:3px solid %3;")
+                         .arg(ui::colors::BG_SURFACE(), ui::colors::BORDER_DIM(), bubble_color));
+    auto* ml = new QVBoxLayout(m);
+    ml->setContentsMargins(14, 10, 14, 12);
+    ml->setSpacing(6);
+    auto* mh = new QHBoxLayout;
+    mh->addWidget(lbl(sender, bubble_color, 11, true));
+    mh->addStretch();
+    mh->addWidget(lbl(ts, ui::colors::TEXT_TERTIARY(), 10));
+    ml->addLayout(mh);
+    auto* mb = lbl(mo["message"].toString(), ui::colors::TEXT_PRIMARY(), 12, false, true);
+    ml->addWidget(mb);
+    layout->insertWidget(layout->count() - 1, m);
 }
 
 // ── Color helpers ─────────────────────────────────────────────────────────────
@@ -232,6 +393,19 @@ SupportScreen::SupportScreen(QWidget* parent) : QWidget(parent) {
     // ── Theme wiring ──────────────────────────────────────────────────────────
     connect(&ui::ThemeManager::instance(), &ui::ThemeManager::theme_changed, this,
             [this](const ui::ThemeTokens&) { apply_styles(); });
+
+    if (local_support_enabled()) {
+        if (category_combo_) {
+            category_combo_->clear();
+            for (const auto& v : local_support_categories()) {
+                const QString cat = v.toString();
+                if (!cat.isEmpty())
+                    category_combo_->addItem(cat[0].toUpper() + cat.mid(1).replace('_', ' '), cat);
+            }
+        }
+        load_tickets();
+        return;
+    }
 
     // Load categories from API, then load tickets
     auth::UserApi::instance().get_support_categories([this](auth::ApiResponse r) {
@@ -802,7 +976,7 @@ void SupportScreen::set_busy(bool busy) {
 void SupportScreen::load_tickets() {
     set_busy(true);
 
-    auth::UserApi::instance().get_tickets([this](auth::ApiResponse r) {
+    auto render_tickets_response = [this](auth::ApiResponse r) {
         set_busy(false);
 
         auto* lay = qobject_cast<QVBoxLayout*>(ticket_container_->layout());
@@ -947,6 +1121,7 @@ void SupportScreen::load_tickets() {
             const QString cat_c = category;
             const QString cr_c = date_str;
             const QString body_c = obj["description"].toString();
+            const QJsonArray local_messages_c = obj["messages"].toArray();
             const bool demo_c = is_demo;
 
             connect(btn, &QPushButton::clicked, this, [=]() {
@@ -1001,8 +1176,26 @@ void SupportScreen::load_tickets() {
                     ml->addWidget(mb);
                     mcl2->insertWidget(mcl2->count() - 1, m);
                 } else {
-                    set_busy(true);
-                    auth::UserApi::instance().get_ticket_details(id_int, [this](auth::ApiResponse dr) {
+                    if (local_support_enabled()) {
+                        auto* mcl3 = qobject_cast<QVBoxLayout*>(messages_container_->layout());
+                        while (mcl3->count() > 1)
+                            delete mcl3->takeAt(0)->widget();
+
+                        for (const auto& mv : local_messages_c)
+                            append_support_message_widget(this, mcl3, mv.toObject());
+
+                        if (local_messages_c.isEmpty()) {
+                            mcl3->insertWidget(
+                                0, lbl("No messages yet — be the first to reply.", ui::colors::TEXT_TERTIARY(), 11));
+                        }
+
+                        QTimer::singleShot(50, this, [this]() {
+                            detail_scroll_->verticalScrollBar()->setValue(
+                                detail_scroll_->verticalScrollBar()->maximum());
+                        });
+                    } else {
+                        set_busy(true);
+                        auth::UserApi::instance().get_ticket_details(id_int, [this](auth::ApiResponse dr) {
                         set_busy(false);
                         if (!dr.success)
                             return;
@@ -1023,42 +1216,8 @@ void SupportScreen::load_tickets() {
                         while (mcl3->count() > 1)
                             delete mcl3->takeAt(0)->widget();
 
-                        for (const auto& mv : msgs) {
-                            auto mo = mv.toObject();
-                            // Handle various field name conventions the API may use
-                            QString sender_type = mo["sender_type"].toString();
-                            if (sender_type.isEmpty())
-                                sender_type = mo["role"].toString();
-                            if (sender_type.isEmpty())
-                                sender_type = mo["type"].toString();
-                            if (sender_type.isEmpty())
-                                sender_type = mo["sender"].toString();
-                            bool is_user = (sender_type == "user" || sender_type == "customer");
-                            QString sender = is_user ? "You" : "Support Team";
-                            QString bubble_color = is_user ? ui::colors::CYAN() : "#9333ea";
-
-                            QString ts;
-                            QDateTime mdt = QDateTime::fromString(mo["created_at"].toString(), Qt::ISODate);
-                            if (mdt.isValid())
-                                ts = mdt.toLocalTime().toString("d MMM yyyy  hh:mm");
-
-                            auto* m = new QWidget(this);
-                            m->setStyleSheet(
-                                QString("background:%1;border:1px solid %2;"
-                                        "border-left:3px solid %3;")
-                                    .arg(ui::colors::BG_SURFACE(), ui::colors::BORDER_DIM(), bubble_color));
-                            auto* ml = new QVBoxLayout(m);
-                            ml->setContentsMargins(14, 10, 14, 12);
-                            ml->setSpacing(6);
-                            auto* mh = new QHBoxLayout;
-                            mh->addWidget(lbl(sender, bubble_color, 11, true));
-                            mh->addStretch();
-                            mh->addWidget(lbl(ts, ui::colors::TEXT_TERTIARY(), 10));
-                            ml->addLayout(mh);
-                            auto* mb = lbl(mo["message"].toString(), ui::colors::TEXT_PRIMARY(), 12, false, true);
-                            ml->addWidget(mb);
-                            mcl3->insertWidget(mcl3->count() - 1, m);
-                        }
+                        for (const auto& mv : msgs)
+                            append_support_message_widget(this, mcl3, mv.toObject());
 
                         if (msgs.isEmpty()) {
                             mcl3->insertWidget(
@@ -1070,7 +1229,8 @@ void SupportScreen::load_tickets() {
                             detail_scroll_->verticalScrollBar()->setValue(
                                 detail_scroll_->verticalScrollBar()->maximum());
                         });
-                    });
+                        });
+                    }
                 }
 
                 content_stack_->setCurrentIndex(2);
@@ -1078,7 +1238,17 @@ void SupportScreen::load_tickets() {
 
             lay->insertWidget(lay->count() - 1, btn);
         }
-    });
+    };
+
+    if (local_support_enabled()) {
+        auth::ApiResponse r;
+        r.success = true;
+        r.data = QJsonObject{{"tickets", local_support_tickets()}};
+        render_tickets_response(r);
+        return;
+    }
+
+    auth::UserApi::instance().get_tickets(render_tickets_response);
 }
 
 // ── on_create_ticket ──────────────────────────────────────────────────────────
@@ -1091,6 +1261,22 @@ void SupportScreen::on_create_ticket() {
 
     set_busy(true);
     create_btn_->setText("Submitting…");
+
+    if (local_support_enabled()) {
+        const QString category = category_combo_->currentData().toString().isEmpty()
+                                     ? category_combo_->currentText().toLower().replace(' ', '_')
+                                     : category_combo_->currentData().toString();
+        const bool ok = create_local_support_ticket(subject, desc, category, priority_combo_->currentText().toLower());
+        set_busy(false);
+        create_btn_->setText("Submit Ticket →");
+        if (ok) {
+            subject_input_->clear();
+            desc_input_->clear();
+            content_stack_->setCurrentIndex(0);
+            load_tickets();
+        }
+        return;
+    }
 
     auth::UserApi::instance().create_ticket(subject, desc, category_combo_->currentText().toLower().replace(' ', '_'),
                                             priority_combo_->currentText().toLower(), [this](auth::ApiResponse r) {
@@ -1116,6 +1302,29 @@ void SupportScreen::on_send_message() {
 
     set_busy(true);
     send_btn_->setText("Sending…");
+
+    if (local_support_enabled()) {
+        const bool ok = append_local_support_message(selected_ticket_id_, msg);
+        set_busy(false);
+        send_btn_->setText("Send Reply →");
+        if (!ok)
+            return;
+
+        msg_input_->clear();
+        auto* mcl = qobject_cast<QVBoxLayout*>(messages_container_->layout());
+        if (!mcl)
+            return;
+        append_support_message_widget(
+            this, mcl,
+            QJsonObject{{"sender_type", "user"},
+                        {"message", msg},
+                        {"created_at", QDateTime::currentDateTimeUtc().toString(Qt::ISODate)}});
+
+        QTimer::singleShot(50, this, [this]() {
+            detail_scroll_->verticalScrollBar()->setValue(detail_scroll_->verticalScrollBar()->maximum());
+        });
+        return;
+    }
 
     auth::UserApi::instance().add_ticket_message(selected_ticket_id_, msg, [this, msg](auth::ApiResponse r) {
         set_busy(false);
@@ -1156,6 +1365,19 @@ void SupportScreen::on_close_ticket() {
     if (selected_ticket_id_ < 0)
         return;
     set_busy(true);
+    if (local_support_enabled()) {
+        const bool ok = update_local_support_status(selected_ticket_id_, "closed");
+        set_busy(false);
+        if (!ok)
+            return;
+        selected_is_closed_ = true;
+        close_btn_->hide();
+        reopen_btn_->show();
+        reply_box_->hide();
+        closed_box_->show();
+        load_tickets();
+        return;
+    }
     auth::UserApi::instance().update_ticket_status(selected_ticket_id_, "closed", [this](auth::ApiResponse r) {
         set_busy(false);
         if (!r.success)
@@ -1173,6 +1395,19 @@ void SupportScreen::on_reopen_ticket() {
     if (selected_ticket_id_ < 0)
         return;
     set_busy(true);
+    if (local_support_enabled()) {
+        const bool ok = update_local_support_status(selected_ticket_id_, "open");
+        set_busy(false);
+        if (!ok)
+            return;
+        selected_is_closed_ = false;
+        reopen_btn_->hide();
+        close_btn_->show();
+        reply_box_->show();
+        closed_box_->hide();
+        load_tickets();
+        return;
+    }
     auth::UserApi::instance().update_ticket_status(selected_ticket_id_, "open", [this](auth::ApiResponse r) {
         set_busy(false);
         if (!r.success)

@@ -7,6 +7,7 @@
 
 #include <QApplication>
 #include <QClipboard>
+#include <QDateTime>
 #include <QDesktopServices>
 #include <QFrame>
 #include <QGridLayout>
@@ -25,6 +26,9 @@ static QString PANEL_SS() {
 }
 static QString HDR_SS() {
     return QString("background:%1;border-bottom:1px solid %2;").arg(ui::colors::BG_RAISED(), ui::colors::BORDER_DIM());
+}
+static bool local_profile_enabled() {
+    return auth::AuthManager::instance().has_local_runtime();
 }
 
 QWidget* ProfileScreen::make_panel(const QString& title) {
@@ -353,6 +357,10 @@ QWidget* ProfileScreen::build_security() {
                 "font-size:10px;font-weight:700;font-family:'Consolas',monospace;}QPushButton:hover{color:%4;}")
             .arg(ui::colors::BG_RAISED(), ui::colors::TEXT_SECONDARY(), ui::colors::BORDER_DIM(), ui::colors::TEXT_PRIMARY()));
     connect(sb, &QPushButton::clicked, this, [this, sb]() {
+        if (local_profile_enabled()) {
+            sec_api_key_->setText("Local Codex runtime");
+            return;
+        }
         api_key_visible_ = !api_key_visible_;
         sb->setText(api_key_visible_ ? "HIDE" : "SHOW");
         sec_api_key_->setText(api_key_visible_ ? auth::AuthManager::instance().effective_api_key()
@@ -366,6 +374,8 @@ QWidget* ProfileScreen::build_security() {
                 "font-size:10px;font-weight:700;font-family:'Consolas',monospace;}QPushButton:hover{color:%4;}")
             .arg(ui::colors::BG_RAISED(), ui::colors::TEXT_SECONDARY(), ui::colors::BORDER_DIM(), ui::colors::TEXT_PRIMARY()));
     connect(cb, &QPushButton::clicked, this, [cb]() {
+        if (local_profile_enabled())
+            return;
         auto key = auth::AuthManager::instance().effective_api_key();
         if (!key.isEmpty()) {
             QApplication::clipboard()->setText(key);
@@ -505,6 +515,44 @@ QWidget* ProfileScreen::build_support() {
 
 void ProfileScreen::refresh_all() {
     const auto& s = auth::AuthManager::instance().session();
+    if (!s.authenticated && local_profile_enabled()) {
+        const QString username = s.user_info.username.isEmpty() ? "local_user" : s.user_info.username;
+        username_header_->setText(username);
+        credits_badge_->setText("CR 0.00");
+        plan_badge_->setText("LOCAL-CODEX");
+        ov_username_->setText(username);
+        ov_email_->setText(s.user_info.email.isEmpty() ? "local@codex" : s.user_info.email);
+        ov_user_type_->setText("LOCAL");
+        ov_account_type_->setText("LOCAL-CODEX");
+        ov_account_type_->setStyleSheet(
+            QString("color:%1;font-size:13px;font-weight:700;background:transparent;%2").arg(ui::colors::AMBER(), MF));
+        ov_phone_->setText("\xe2\x80\x94");
+        ov_country_->setText("\xe2\x80\x94");
+        ov_verified_->setText("YES");
+        ov_verified_->setStyleSheet(QString("color:%1;font-size:13px;font-weight:700;background:transparent;%2")
+                                        .arg(ui::colors::POSITIVE(), MF));
+        ov_mfa_->setText("DISABLED");
+        ov_mfa_->setStyleSheet(QString("color:%1;font-size:13px;font-weight:700;background:transparent;%2")
+                                   .arg(ui::colors::TEXT_SECONDARY(), MF));
+        ov_credits_big_->setText("0");
+        ov_plan_->setText("LOCAL-CODEX");
+        ov_plan_->setStyleSheet(
+            QString("color:%1;font-size:13px;font-weight:700;background:transparent;%2").arg(ui::colors::AMBER(), MF));
+        sec_api_key_->setText("Local Codex runtime");
+        sec_verified_->setText("YES");
+        sec_verified_->setStyleSheet(QString("color:%1;font-size:13px;font-weight:700;background:transparent;%2")
+                                         .arg(ui::colors::POSITIVE(), MF));
+        sec_mfa_->setText("DISABLED");
+        sec_mfa_->setStyleSheet(QString("color:%1;font-size:13px;font-weight:700;background:transparent;%2")
+                                    .arg(ui::colors::TEXT_SECONDARY(), MF));
+        bill_plan_->setText("LOCAL-CODEX");
+        bill_credits_->setText("0.00");
+        bill_support_->setText("LOCAL");
+        fetch_usage_data();
+        fetch_billing_data();
+        fetch_login_history();
+        return;
+    }
     if (!s.authenticated)
         return;
     username_header_->setText(s.user_info.username.isEmpty() ? s.user_info.email : s.user_info.username);
@@ -549,6 +597,18 @@ void ProfileScreen::fetch_usage_data() {
     usg_credits_->setText(QString::number(s.user_info.credit_balance, 'f', 0));
     usg_plan_->setText(s.account_type().toUpper());
     usg_rate_->setText("—");
+
+    if (local_profile_enabled()) {
+        usg_plan_->setText("LOCAL-CODEX");
+        usg_rate_->setText("LOCAL");
+        usg_total_req_->setText("0");
+        usg_cred_used_->setText("0");
+        usg_avg_cred_->setText("0.00");
+        usg_avg_resp_->setText("0");
+        usg_daily_table_->setRowCount(0);
+        usg_endpoint_table_->setRowCount(0);
+        return;
+    }
 
     QPointer<ProfileScreen> self = this;
     auth::UserApi::instance().get_user_usage(30, [self](auth::ApiResponse r) {
@@ -607,6 +667,14 @@ void ProfileScreen::fetch_usage_data() {
 
 void ProfileScreen::fetch_billing_data() {
     LOG_INFO("Profile", "Fetching billing data...");
+    if (local_profile_enabled()) {
+        bill_plan_->setText("LOCAL-CODEX");
+        bill_credits_->setText("0.00");
+        bill_support_->setText("LOCAL");
+        bill_history_->setRowCount(0);
+        return;
+    }
+
     QPointer<ProfileScreen> self = this;
     auth::UserApi::instance().get_user_subscription([self](auth::ApiResponse r) {
         if (!self)
@@ -650,6 +718,17 @@ void ProfileScreen::fetch_billing_data() {
 
 void ProfileScreen::fetch_login_history() {
     LOG_INFO("Profile", "Fetching login history...");
+    if (local_profile_enabled()) {
+        sec_login_hist_->setRowCount(0);
+        const int row = sec_login_hist_->rowCount();
+        sec_login_hist_->insertRow(row);
+        sec_login_hist_->setItem(row, 0,
+                                 new QTableWidgetItem(QDateTime::currentDateTime().toString("yyyy-MM-dd hh:mm:ss")));
+        sec_login_hist_->setItem(row, 1, new QTableWidgetItem("local"));
+        sec_login_hist_->setItem(row, 2, new QTableWidgetItem("CODEX"));
+        return;
+    }
+
     QPointer<ProfileScreen> self = this;
     auth::UserApi::instance().get_login_history(20, 0, [self](auth::ApiResponse r) {
         if (!self)
@@ -675,6 +754,11 @@ void ProfileScreen::fetch_login_history() {
 }
 
 void ProfileScreen::show_edit_profile_dialog() {
+    if (local_profile_enabled()) {
+        QMessageBox::information(this, "Local Profile", "Local Codex profile is derived from the local runtime.");
+        return;
+    }
+
     auto* dlg = new QDialog(this);
     dlg->setWindowTitle("Edit Profile");
     dlg->setFixedSize(420, 300);
@@ -750,6 +834,11 @@ void ProfileScreen::show_logout_confirm() {
 }
 
 void ProfileScreen::show_regen_confirm() {
+    if (local_profile_enabled()) {
+        QMessageBox::information(this, "Local Runtime", "Fincept API key regeneration is disabled in local Codex mode.");
+        return;
+    }
+
     if (QMessageBox::warning(this, "Regenerate API Key", "Your current API key will be invalidated. Continue?",
                              QMessageBox::Yes | QMessageBox::No, QMessageBox::No) == QMessageBox::Yes) {
         auth::UserApi::instance().regenerate_api_key([this](auth::ApiResponse r) {
