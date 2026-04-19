@@ -263,7 +263,7 @@ RUNTIME_VENV="$APP_DIR/build/$PRESET/venv-numpy2"
 [ -x "$RUNTIME_VENV/bin/python3" ] || "$PYTHON" -m venv "$RUNTIME_VENV"
 "$RUNTIME_VENV/bin/python3" -m pip install --quiet --upgrade pip
 "$RUNTIME_VENV/bin/python3" -m pip install --quiet \
-    yfinance requests beautifulsoup4 trafilatura geopy pycountry sentence-transformers gliner \
+    yfinance requests beautifulsoup4 trafilatura geopy pycountry sentence-transformers gliner ta \
     || fail "Python runtime dependency install failed."
 ok
 

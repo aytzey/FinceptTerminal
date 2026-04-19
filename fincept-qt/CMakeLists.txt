@@ -2148,5 +2148,6 @@ message(STATUS "")
 
 # ── Test suite (opt-in; see fincept-qt/tests/CMakeLists.txt) ─────────────────
 if(FINCEPT_BUILD_TESTS)
+    enable_testing()
     add_subdirectory(tests)
 endif()

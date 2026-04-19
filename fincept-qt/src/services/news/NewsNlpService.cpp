@@ -47,7 +47,7 @@ void NewsNlpService::extract_entities(const QVector<NewsArticle>& articles, Enti
                 return;
             }
 
-            auto doc = QJsonDocument::fromJson(result.output.toUtf8());
+            auto doc = QJsonDocument::fromJson(python::extract_json(result.output).toUtf8());
             auto obj = doc.object();
             if (!obj["success"].toBool()) {
                 cb(false, {});
@@ -106,7 +106,7 @@ void NewsNlpService::cluster_semantic(const QVector<NewsArticle>& articles, Sema
                 cb(false, {});
                 return;
             }
-            auto doc = QJsonDocument::fromJson(result.output.toUtf8());
+            auto doc = QJsonDocument::fromJson(python::extract_json(result.output).toUtf8());
             auto obj = doc.object();
             cb(obj["success"].toBool(), obj["clusters"].toArray());
         });
@@ -126,7 +126,8 @@ void NewsNlpService::geolocate_articles(const QVector<NewsArticle>& articles, Ge
                                                  return;
                                              }
 
-                                             auto doc = QJsonDocument::fromJson(result.output.toUtf8());
+                                             auto doc =
+                                                 QJsonDocument::fromJson(python::extract_json(result.output).toUtf8());
                                              auto obj = doc.object();
                                              if (!obj["success"].toBool()) {
                                                  cb(false, {});
@@ -167,7 +168,7 @@ void NewsNlpService::nearby_infrastructure(double lat, double lon, int radius_km
             cb(false, {});
             return;
         }
-        auto doc = QJsonDocument::fromJson(result.output.toUtf8());
+        auto doc = QJsonDocument::fromJson(python::extract_json(result.output).toUtf8());
         auto obj = doc.object();
         if (!obj["success"].toBool()) {
             cb(false, {});
@@ -196,7 +197,7 @@ void NewsNlpService::translate_text(const QString& text, const QString& target_l
                 cb(false, {}, {});
                 return;
             }
-            auto doc = QJsonDocument::fromJson(result.output.toUtf8());
+            auto doc = QJsonDocument::fromJson(python::extract_json(result.output).toUtf8());
             auto obj = doc.object();
             cb(obj["success"].toBool(), obj["translated"].toString(), obj["detected_lang"].toString());
         });

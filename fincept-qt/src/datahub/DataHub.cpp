@@ -94,7 +94,7 @@ void DataHub::on_owner_destroyed(QObject* owner) {
             if (sub_it == subscriptions_.end()) continue;
             auto& vec = sub_it.value();
             vec.erase(std::remove_if(vec.begin(), vec.end(),
-                         [owner](const Subscription& s) { return s.owner.data() == owner; }),
+                         [owner](const Subscription& s) { return !s.owner || s.owner.data() == owner; }),
                       vec.end());
             if (vec.isEmpty()) {
                 subscriptions_.erase(sub_it);
@@ -113,7 +113,7 @@ void DataHub::on_owner_destroyed(QObject* owner) {
             if (sub_it == pattern_subscriptions_.end()) continue;
             auto& vec = sub_it.value();
             vec.erase(std::remove_if(vec.begin(), vec.end(),
-                         [owner](const Subscription& s) { return s.owner.data() == owner; }),
+                         [owner](const Subscription& s) { return !s.owner || s.owner.data() == owner; }),
                       vec.end());
             if (vec.isEmpty())
                 pattern_subscriptions_.erase(sub_it);

@@ -164,6 +164,10 @@ class TestDataHub : public QObject {
         RecordingProducer prod({"test:flight:*"});
         hub.register_producer(&prod);
 
+        TopicPolicy p;
+        p.min_interval_ms = 0;
+        hub.set_policy("test:flight:1", p);
+
         QObject owner;
         hub.subscribe(&owner, "test:flight:1",
                       [](const QVariant&) {});

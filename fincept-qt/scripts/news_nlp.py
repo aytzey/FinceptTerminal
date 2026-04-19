@@ -289,10 +289,11 @@ def extract_entities(headlines_json):
         common = {"THE", "FOR", "AND", "BUT", "NOT", "FROM", "WITH", "THIS", "THAT",
                   "HAVE", "WILL", "BEEN", "THEY", "WERE", "SAID", "HAS", "ITS", "NEW",
                   "ARE", "WAS", "WHO", "HOW", "WHY", "ALL", "CAN", "MAY", "NOW", "SEC",
-                  "GDP", "CEO", "CFO", "IPO", "ETF", "GDP", "CPI", "PMI"}
+                  "CEO", "CFO", "IPO", "ETF", "GDP", "CPI", "PMI"}
+        country_codes = {c["code"] for c in countries if c.get("code")}
         for m in re.finditer(r'\b[A-Z]{2,5}\b', text):
             t = m.group()
-            if t not in common:
+            if t not in common and t not in country_codes:
                 tickers.append(t)
                 all_tickers[t] += 1
 

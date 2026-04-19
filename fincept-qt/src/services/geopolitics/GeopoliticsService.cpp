@@ -511,8 +511,6 @@ static QVector<HDXDataset> parse_hdx_results(const QString& output) {
     return datasets;
 }
 
-static inline void publish_hdx(GeopoliticsService* self, const QString& context, const QVector<HDXDataset>& datasets);
-
 void GeopoliticsService::search_hdx_conflicts() {
     run_python("hdx_data.py", {"search_conflict", "", "20"}, "hdx_conflicts", [this](bool ok, const QString& out) {
         if (!ok) {

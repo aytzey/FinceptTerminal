@@ -5,7 +5,11 @@
 # Qt Test executable that links the minimum subset of sources it needs
 # (no linking against the full FinceptTerminal target — keeps tests fast).
 
-find_package(Qt6 ${FINCEPT_QT_VERSION} EXACT REQUIRED COMPONENTS Test)
+if(FINCEPT_ALLOW_QT_DRIFT)
+    find_package(Qt6 REQUIRED COMPONENTS Test)
+else()
+    find_package(Qt6 ${FINCEPT_QT_VERSION} EXACT REQUIRED COMPONENTS Test)
+endif()
 
 enable_testing()
 
