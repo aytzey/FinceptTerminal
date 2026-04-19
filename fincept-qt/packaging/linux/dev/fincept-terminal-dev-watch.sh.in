@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR="__APP_DIR__"
+BUILD_DIR="$APP_DIR/build/linux-release"
+STAMP="$BUILD_DIR/.dev-build-stamp"
+
+configure_and_build() {
+    local now
+    now="$(date '+%Y-%m-%d %H:%M:%S')"
+    echo "[$now] Building FinceptTerminal"
+    cd "$APP_DIR"
+    if cmake --preset linux-release -DCMAKE_PREFIX_PATH="__CMAKE_PREFIX_PATH__" __EXTRA_CMAKE_ARGS__ \
+        && cmake --build --preset linux-release -j"$(nproc)"; then
+        touch "$STAMP"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Build finished"
+    else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Build failed"
+    fi
+}
+
+drain_events() {
+    local ignored
+    while IFS= read -r -t 0.75 ignored; do
+        :
+    done
+}
+
+watch_loop() {
+    inotifywait \
+        --monitor \
+        --recursive \
+        --event close_write,create,delete,move,attrib \
+        --exclude '(^|/)(build|\.git|\.qt|\.aqt-venv|__pycache__|node_modules)(/|$)' \
+        --format '%w%f' \
+        "$APP_DIR/src" \
+        "$APP_DIR/resources" \
+        "$APP_DIR/tests" \
+        "$APP_DIR/cmake" \
+        "$APP_DIR/CMakeLists.txt" \
+        "$APP_DIR/CMakePresets.json"
+}
+
+configure_and_build
+
+while IFS= read -r changed_path; do
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Change detected: $changed_path"
+    drain_events
+    configure_and_build
+done < <(watch_loop)

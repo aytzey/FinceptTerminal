@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Fincept Terminal Dev
+Comment=Auto-built local development build
+Exec=__LAUNCH_SCRIPT_PATH__
+Path=__APP_DIR__
+Icon=__ICON_PATH__
+Terminal=false
+StartupNotify=true
+Categories=Development;Office;Finance;
+Keywords=fincept;terminal;finance;trading;development;

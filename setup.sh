@@ -3,9 +3,11 @@ set -euo pipefail
 
 # ── Parse args ──────────────────────────────────────────────
 CI_MODE=false
+ALLOW_QT_DRIFT=false
 for arg in "$@"; do
     case "$arg" in
         --ci) CI_MODE=true ;;
+        --allow-qt-drift) ALLOW_QT_DRIFT=true ;;
     esac
 done
 
@@ -50,13 +52,107 @@ version_ge() {
     [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]
 }
 
+escape_sed_replacement() {
+    printf '%s' "$1" | sed 's/[\/&]/\\&/g'
+}
+
+normalize_qt_prefix() {
+    local candidate="$1"
+    if [ -f "$candidate/lib/cmake/Qt6/Qt6Config.cmake" ]; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+    if [ -f "$candidate/cmake/Qt6/Qt6Config.cmake" ]; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+    if [ -f "$candidate/Qt6Config.cmake" ]; then
+        case "$candidate" in
+            */lib/cmake/Qt6) printf '%s\n' "${candidate%/lib/cmake/Qt6}" ;;
+            */cmake/Qt6) printf '%s\n' "${candidate%/cmake/Qt6}" ;;
+            *) printf '%s\n' "$candidate" ;;
+        esac
+        return 0
+    fi
+    return 1
+}
+
+install_linux_dev_integration() {
+    local dev_dir="$APP_DIR/packaging/linux/dev"
+    local bin_dir="$HOME/.local/bin"
+    local app_dir="$HOME/.local/share/applications"
+    local systemd_dir="$HOME/.config/systemd/user"
+    local launcher_path="$bin_dir/fincept-terminal-dev"
+    local watcher_path="$bin_dir/fincept-terminal-dev-watch"
+    local desktop_path="$app_dir/fincept-terminal-dev.desktop"
+    local service_path="$systemd_dir/fincept-terminal-dev.service"
+    local icon_path="$SCRIPT_DIR/fincept_icon.ico"
+    local extra_cmake_args=""
+
+    [ "$ALLOW_QT_DRIFT" = true ] && extra_cmake_args="-DFINCEPT_ALLOW_QT_DRIFT=ON"
+
+    mkdir -p "$bin_dir" "$app_dir" "$systemd_dir"
+
+    local app_dir_escaped qt_prefix_escaped extra_args_escaped launcher_path_escaped watcher_path_escaped icon_path_escaped
+    app_dir_escaped="$(escape_sed_replacement "$APP_DIR")"
+    qt_prefix_escaped="$(escape_sed_replacement "$QT_PREFIX")"
+    extra_args_escaped="$(escape_sed_replacement "$extra_cmake_args")"
+    launcher_path_escaped="$(escape_sed_replacement "$launcher_path")"
+    watcher_path_escaped="$(escape_sed_replacement "$watcher_path")"
+    icon_path_escaped="$(escape_sed_replacement "$icon_path")"
+
+    sed \
+        -e "s/__APP_DIR__/$app_dir_escaped/g" \
+        -e "s/__CMAKE_PREFIX_PATH__/$qt_prefix_escaped/g" \
+        -e "s/__EXTRA_CMAKE_ARGS__/$extra_args_escaped/g" \
+        "$dev_dir/fincept-terminal-dev-launch.sh.in" > "$launcher_path"
+    chmod 755 "$launcher_path"
+
+    sed \
+        -e "s/__APP_DIR__/$app_dir_escaped/g" \
+        -e "s/__CMAKE_PREFIX_PATH__/$qt_prefix_escaped/g" \
+        -e "s/__EXTRA_CMAKE_ARGS__/$extra_args_escaped/g" \
+        "$dev_dir/fincept-terminal-dev-watch.sh.in" > "$watcher_path"
+    chmod 755 "$watcher_path"
+
+    sed \
+        -e "s/__APP_DIR__/$app_dir_escaped/g" \
+        -e "s/__WATCH_SCRIPT_PATH__/$watcher_path_escaped/g" \
+        "$dev_dir/fincept-terminal-dev.service.in" > "$service_path"
+
+    sed \
+        -e "s/__APP_DIR__/$app_dir_escaped/g" \
+        -e "s/__LAUNCH_SCRIPT_PATH__/$launcher_path_escaped/g" \
+        -e "s/__ICON_PATH__/$icon_path_escaped/g" \
+        "$dev_dir/fincept-terminal-dev.desktop.in" > "$desktop_path"
+
+    if command -v update-desktop-database &>/dev/null; then
+        update-desktop-database "$app_dir" >/dev/null 2>&1 || true
+    fi
+
+    if command -v systemctl &>/dev/null && systemctl --user show-environment &>/dev/null; then
+        systemctl --user daemon-reload
+        systemctl --user enable --now fincept-terminal-dev.service >/dev/null
+        info "Installed Start menu launcher: Fincept Terminal Dev"
+        info "Enabled auto-builder service: fincept-terminal-dev.service"
+    else
+        info "Installed launcher files, but could not enable systemd --user service in this session."
+    fi
+}
+
+TOTAL_STEPS=7
+if [ "$PLATFORM" = "linux" ] && [ "$CI_MODE" = false ]; then
+    TOTAL_STEPS=8
+fi
+
 # ── Step 1: System dependencies (build tools only) ──────────
-echo "[1/7] Installing system build tools..."
+echo "[1/${TOTAL_STEPS}] Installing system build tools..."
 if [ "$PLATFORM" = "linux" ]; then
     command -v apt-get &>/dev/null || fail "apt-get not found. Install cmake / ninja-build / g++ / python3.11 / python3-pip manually."
     sudo apt-get update -qq
     sudo apt-get install -y --no-install-recommends \
         git cmake ninja-build g++ \
+        inotify-tools \
         python3 python3-pip python3-venv \
         libgl1-mesa-dev libglu1-mesa-dev \
         libxkbcommon-dev libxkbcommon-x11-dev \
@@ -73,7 +169,7 @@ fi
 ok
 
 # ── Step 2: Verify compiler version ─────────────────────────
-echo "[2/7] Checking C++ compiler..."
+echo "[2/${TOTAL_STEPS}] Checking C++ compiler..."
 if [ "$PLATFORM" = "linux" ]; then
     command -v g++ &>/dev/null || fail "g++ not found."
     GCC_VER="$(g++ -dumpfullversion -dumpversion 2>/dev/null || g++ --version | head -1 | awk '{print $NF}')"
@@ -88,7 +184,7 @@ fi
 ok
 
 # ── Step 3: Verify CMake version ────────────────────────────
-echo "[3/7] Checking CMake..."
+echo "[3/${TOTAL_STEPS}] Checking CMake..."
 command -v cmake &>/dev/null || fail "cmake not found."
 CMAKE_VER="$(cmake --version | head -1 | awk '{print $3}')"
 echo "  cmake ${CMAKE_VER}"
@@ -96,7 +192,7 @@ version_ge "$CMAKE_VER" "$CMAKE_MIN" || fail "CMake ${CMAKE_MIN}+ required. Foun
 ok
 
 # ── Step 4: Verify Python version ───────────────────────────
-echo "[4/7] Checking Python..."
+echo "[4/${TOTAL_STEPS}] Checking Python..."
 PYTHON="$(command -v python3.11 || command -v python3 || true)"
 [ -n "$PYTHON" ] || fail "python3 not found."
 PY_VER="$($PYTHON -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])')"
@@ -109,9 +205,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 QT_INSTALL_ROOT="${FINCEPT_QT_ROOT:-$SCRIPT_DIR/.qt}"
 QT_PREFIX="$QT_INSTALL_ROOT/$QT_VERSION/$QT_KIT"
 
-echo "[5/7] Locating Qt ${QT_VERSION}..."
-if [ -n "${Qt6_DIR:-}" ] && [ -f "$Qt6_DIR/lib/cmake/Qt6/Qt6Config.cmake" ]; then
-    QT_PREFIX="$Qt6_DIR"
+echo "[5/${TOTAL_STEPS}] Locating Qt ${QT_VERSION}..."
+if [ -n "${Qt6_DIR:-}" ] && QT_ENV_PREFIX="$(normalize_qt_prefix "$Qt6_DIR")"; then
+    QT_PREFIX="$QT_ENV_PREFIX"
     info "Using Qt from Qt6_DIR env: $QT_PREFIX"
 elif [ -f "$QT_PREFIX/lib/cmake/Qt6/Qt6Config.cmake" ]; then
     info "Qt ${QT_VERSION} already installed at $QT_PREFIX"
@@ -119,9 +215,11 @@ else
     info "Installing Qt ${QT_VERSION} via aqtinstall to $QT_INSTALL_ROOT ..."
     # aqtinstall is a stable community tool that downloads exact Qt versions
     # from the official Qt mirror. Much smaller than Qt Online Installer and scriptable.
-    "$PYTHON" -m pip install --user --quiet --upgrade aqtinstall
-    AQT="$("$PYTHON" -m pip show aqtinstall >/dev/null 2>&1 && "$PYTHON" -m aqt help >/dev/null 2>&1 && echo "$PYTHON -m aqt" || echo "")"
-    [ -n "$AQT" ] || fail "aqtinstall did not install correctly."
+    AQT_VENV="$SCRIPT_DIR/.aqt-venv"
+    [ -x "$AQT_VENV/bin/python" ] || "$PYTHON" -m venv "$AQT_VENV"
+    "$AQT_VENV/bin/python" -m pip install --quiet --upgrade pip aqtinstall
+    "$AQT_VENV/bin/python" -m aqt help >/dev/null 2>&1 || fail "aqtinstall did not install correctly."
+    AQT="$AQT_VENV/bin/python -m aqt"
     # Qt host/target/arch
     if [ "$PLATFORM" = "linux" ]; then
         AQT_HOST="linux"   ; AQT_TARGET="desktop" ; AQT_ARCH="gcc_64"
@@ -145,17 +243,25 @@ APP_DIR="$SCRIPT_DIR/fincept-qt"
 [ -d "$APP_DIR" ] || fail "fincept-qt directory not found. Ensure you cloned the full repository."
 cd "$APP_DIR"
 
-echo "[6/7] Configuring (preset: $PRESET)..."
+echo "[6/${TOTAL_STEPS}] Configuring (preset: $PRESET)..."
 # Override the preset's default CMAKE_PREFIX_PATH with the one we just set,
 # so the build picks up the aqtinstall location rather than ~/Qt/6.8.3/...
-cmake --preset "$PRESET" -DCMAKE_PREFIX_PATH="$QT_PREFIX" \
+CONFIGURE_ARGS=(--preset "$PRESET" "-DCMAKE_PREFIX_PATH=$QT_PREFIX")
+[ "$ALLOW_QT_DRIFT" = true ] && CONFIGURE_ARGS+=(-DFINCEPT_ALLOW_QT_DRIFT=ON)
+cmake "${CONFIGURE_ARGS[@]}" \
     || fail "CMake configure failed. See error above."
 ok
 
 # ── Step 7: Build ───────────────────────────────────────────
-echo "[7/7] Compiling..."
+echo "[7/${TOTAL_STEPS}] Compiling..."
 cmake --build --preset "$PRESET" || fail "Build failed. See error above."
 ok
+
+if [ "$PLATFORM" = "linux" ] && [ "$CI_MODE" = false ]; then
+    echo "[8/${TOTAL_STEPS}] Installing Linux development launcher..."
+    install_linux_dev_integration
+    ok
+fi
 
 # ── Done ────────────────────────────────────────────────────
 BIN="$APP_DIR/build/$PRESET/FinceptTerminal"
@@ -165,6 +271,8 @@ echo ""
 echo "================================================"
 echo "  Build complete!"
 echo "  Run: $BIN"
+[ "$PLATFORM" = "linux" ] && [ "$CI_MODE" = false ] && echo "  Menu: Fincept Terminal Dev"
+[ "$PLATFORM" = "linux" ] && [ "$CI_MODE" = false ] && echo "  Dev CLI: $HOME/.local/bin/fincept-terminal-dev"
 echo "================================================"
 echo ""
 

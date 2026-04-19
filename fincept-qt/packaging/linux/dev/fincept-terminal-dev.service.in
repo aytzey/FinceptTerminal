@@ -1,0 +1,13 @@
+[Unit]
+Description=Fincept Terminal development auto-builder
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=__APP_DIR__
+ExecStart=__WATCH_SCRIPT_PATH__
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

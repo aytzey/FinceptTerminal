@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR="__APP_DIR__"
+BUILD_DIR="$APP_DIR/build/linux-release"
+BIN="$BUILD_DIR/FinceptTerminal"
+STAMP="$BUILD_DIR/.dev-build-stamp"
+
+needs_build=0
+
+if [ ! -x "$BIN" ] || [ ! -f "$STAMP" ]; then
+    needs_build=1
+else
+    if [ "$APP_DIR/CMakeLists.txt" -nt "$STAMP" ] || [ "$APP_DIR/CMakePresets.json" -nt "$STAMP" ]; then
+        needs_build=1
+    elif find "$APP_DIR/src" "$APP_DIR/resources" "$APP_DIR/tests" "$APP_DIR/cmake" -type f -newer "$STAMP" -print -quit | grep -q .; then
+        needs_build=1
+    fi
+fi
+
+if [ "$needs_build" -eq 1 ]; then
+    cd "$APP_DIR"
+    cmake --preset linux-release -DCMAKE_PREFIX_PATH="__CMAKE_PREFIX_PATH__" __EXTRA_CMAKE_ARGS__
+    cmake --build --preset linux-release -j"$(nproc)"
+    touch "$STAMP"
+fi
+
+cd "$APP_DIR"
+exec "$BIN" "$@"
