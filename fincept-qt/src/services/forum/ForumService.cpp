@@ -4,7 +4,6 @@
 #include "auth/AuthManager.h"
 #include "core/config/AppPaths.h"
 #include "core/logging/Logger.h"
-#include "storage/cache/CacheManager.h"
 
 #include <QDateTime>
 #include <QDir>
@@ -12,26 +11,14 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
-#include <QNetworkReply>
-#include <QNetworkRequest>
 #include <QUrl>
 #include <QUrlQuery>
 #include <QUuid>
 
 #include <algorithm>
 
-static constexpr int kCategoriesTtlSec  = 5 * 60;
-static constexpr int kStatsTtlSec       = 2 * 60;
-static constexpr int kTrendingTtlSec    = 2 * 60;
-static constexpr int kTransferTimeoutMs = 10000; // 10s per API request
-
 namespace fincept::services {
 namespace {
-
-bool local_forum_enabled() {
-    const auto& auth = auth::AuthManager::instance();
-    return auth.has_local_runtime() || !auth.has_fincept_api_key();
-}
 
 QString local_store_path() {
     return fincept::AppPaths::data() + "/forum_local.json";
@@ -536,108 +523,35 @@ ForumService& ForumService::instance() {
     return s;
 }
 
-ForumService::ForumService() {
-    nam_ = new QNetworkAccessManager(this);
-}
+ForumService::ForumService() = default;
 
-QString ForumService::api_key() const {
-    return auth::AuthManager::instance().effective_api_key();
-}
-
-// ── Low-level HTTP helpers ────────────────────────────────────────────────────
+// ── Low-level local store helpers ────────────────────────────────────────────
 
 void ForumService::get(const QString& path, std::function<void(bool, QJsonObject)> cb) {
-    if (local_forum_enabled()) {
-        QJsonObject data;
-        QString error;
-        const bool ok = local_get(path, data, error);
-        if (!ok)
-            LOG_WARN("ForumService", error);
-        cb(ok, data);
-        return;
-    }
-
-    QNetworkRequest req(QUrl(QString(BASE) + path));
-    req.setRawHeader("X-API-KEY", api_key().toUtf8());
-    req.setRawHeader("Accept", "application/json");
-    req.setTransferTimeout(kTransferTimeoutMs);
-
-    auto* reply = nam_->get(req);
-    connect(reply, &QNetworkReply::finished, this, [reply, cb]() {
-        reply->deleteLater();
-        if (reply->error() != QNetworkReply::NoError) {
-            LOG_WARN("ForumService", QString("GET error: %1").arg(reply->errorString()));
-            cb(false, {});
-            return;
-        }
-        auto doc = QJsonDocument::fromJson(reply->readAll());
-        auto root = doc.object();
-        if (!root.value("success").toBool()) {
-            LOG_WARN("ForumService", QString("API error: %1").arg(root.value("message").toString()));
-            cb(false, root);
-            return;
-        }
-        cb(true, root.value("data").toObject());
-    });
+    QJsonObject data;
+    QString error;
+    const bool ok = local_get(path, data, error);
+    if (!ok)
+        LOG_WARN("ForumService", error);
+    cb(ok, data);
 }
 
 void ForumService::post_req(const QString& path, const QJsonObject& body, std::function<void(bool, QJsonObject)> cb) {
-    if (local_forum_enabled()) {
-        QJsonObject data;
-        QString error;
-        const bool ok = local_post(path, body, data, error);
-        if (!ok)
-            LOG_WARN("ForumService", error);
-        cb(ok, data);
-        return;
-    }
-
-    QNetworkRequest req(QUrl(QString(BASE) + path));
-    req.setRawHeader("X-API-KEY", api_key().toUtf8());
-    req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
-    req.setTransferTimeout(kTransferTimeoutMs);
-
-    auto* reply = nam_->post(req, QJsonDocument(body).toJson(QJsonDocument::Compact));
-    connect(reply, &QNetworkReply::finished, this, [reply, cb]() {
-        reply->deleteLater();
-        if (reply->error() != QNetworkReply::NoError) {
-            LOG_WARN("ForumService", QString("POST error: %1").arg(reply->errorString()));
-            cb(false, {});
-            return;
-        }
-        auto doc = QJsonDocument::fromJson(reply->readAll());
-        auto root = doc.object();
-        cb(root.value("success").toBool(), root.value("data").toObject());
-    });
+    QJsonObject data;
+    QString error;
+    const bool ok = local_post(path, body, data, error);
+    if (!ok)
+        LOG_WARN("ForumService", error);
+    cb(ok, data);
 }
 
 void ForumService::put_req(const QString& path, const QJsonObject& body, std::function<void(bool, QJsonObject)> cb) {
-    if (local_forum_enabled()) {
-        QJsonObject data;
-        QString error;
-        const bool ok = local_put(path, body, data, error);
-        if (!ok)
-            LOG_WARN("ForumService", error);
-        cb(ok, data);
-        return;
-    }
-
-    QNetworkRequest req(QUrl(QString(BASE) + path));
-    req.setRawHeader("X-API-KEY", api_key().toUtf8());
-    req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
-    req.setTransferTimeout(kTransferTimeoutMs);
-
-    auto* reply = nam_->put(req, QJsonDocument(body).toJson(QJsonDocument::Compact));
-    connect(reply, &QNetworkReply::finished, this, [reply, cb]() {
-        reply->deleteLater();
-        if (reply->error() != QNetworkReply::NoError) {
-            cb(false, {});
-            return;
-        }
-        auto doc = QJsonDocument::fromJson(reply->readAll());
-        auto root = doc.object();
-        cb(root.value("success").toBool(), root.value("data").toObject());
-    });
+    QJsonObject data;
+    QString error;
+    const bool ok = local_put(path, body, data, error);
+    if (!ok)
+        LOG_WARN("ForumService", error);
+    cb(ok, data);
 }
 
 // ── Parsers ───────────────────────────────────────────────────────────────────
@@ -735,29 +649,11 @@ ForumProfile ForumService::parse_profile(const QJsonObject& o) {
 // ── Public API ────────────────────────────────────────────────────────────────
 
 void ForumService::fetch_categories(CategoriesCallback cb) {
-    const QVariant cached = local_forum_enabled() ? QVariant{} : fincept::CacheManager::instance().get("forum:categories");
-    if (!cached.isNull()) {
-        auto root = QJsonDocument::fromJson(cached.toString().toUtf8()).object();
-        QVector<ForumCategory> cats;
-        for (const auto& v : root["categories"].toArray())
-            cats.append(parse_category(v.toObject()));
-        ForumPermissions perms;
-        auto po = root["permissions"].toObject();
-        perms.can_create_posts = po["can_create_posts"].toBool();
-        perms.can_vote = po["can_vote"].toBool();
-        perms.can_comment = po["can_comment"].toBool();
-        cb(true, cats, perms);
-        return;
-    }
-
     get("/forum/categories", [cb](bool ok, QJsonObject data) {
         if (!ok) {
             cb(false, {}, {});
             return;
         }
-        fincept::CacheManager::instance().put(
-            "forum:categories", QVariant(QString::fromUtf8(QJsonDocument(data).toJson(QJsonDocument::Compact))),
-            kCategoriesTtlSec, "forum");
         QVector<ForumCategory> cats;
         for (const auto& v : data.value("categories").toArray())
             cats.append(parse_category(v.toObject()));
@@ -816,45 +712,21 @@ void ForumService::fetch_post(const QString& post_uuid, PostDetailCallback cb) {
 }
 
 void ForumService::fetch_stats(StatsCallback cb) {
-    const QVariant cached = local_forum_enabled() ? QVariant{} : fincept::CacheManager::instance().get("forum:stats");
-    if (!cached.isNull()) {
-        auto data = QJsonDocument::fromJson(cached.toString().toUtf8()).object();
-        cb(true, parse_stats(data));
-        return;
-    }
-
     get("/forum/stats", [cb](bool ok, QJsonObject data) {
         if (!ok) {
             cb(false, {});
             return;
         }
-        fincept::CacheManager::instance().put(
-            "forum:stats", QVariant(QString::fromUtf8(QJsonDocument(data).toJson(QJsonDocument::Compact))),
-            kStatsTtlSec, "forum");
         cb(true, parse_stats(data));
     });
 }
 
 void ForumService::fetch_trending(PostsCallback cb) {
-    const QVariant cached = local_forum_enabled() ? QVariant{} : fincept::CacheManager::instance().get("forum:trending");
-    if (!cached.isNull()) {
-        auto data = QJsonDocument::fromJson(cached.toString().toUtf8()).object();
-        ForumPostsPage result;
-        for (const auto& v : data.value("trending_posts").toArray())
-            result.posts.append(parse_post(v.toObject()));
-        result.total = data.value("total").toInt();
-        cb(true, result);
-        return;
-    }
-
     get("/forum/posts/trending", [cb](bool ok, QJsonObject data) {
         if (!ok) {
             cb(false, {});
             return;
         }
-        fincept::CacheManager::instance().put(
-            "forum:trending", QVariant(QString::fromUtf8(QJsonDocument(data).toJson(QJsonDocument::Compact))),
-            kTrendingTtlSec, "forum");
         ForumPostsPage result;
         for (const auto& v : data.value("trending_posts").toArray())
             result.posts.append(parse_post(v.toObject()));

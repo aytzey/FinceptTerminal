@@ -2,7 +2,6 @@
 #pragma once
 #include "services/forum/ForumModels.h"
 
-#include <QNetworkAccessManager>
 #include <QObject>
 #include <QString>
 #include <QVector>
@@ -50,7 +49,6 @@ class ForumService : public QObject {
 
   private:
     ForumService();
-    QString api_key() const;
 
     void get(const QString& path, std::function<void(bool, QJsonObject)> cb);
     void post_req(const QString& path, const QJsonObject& body, std::function<void(bool, QJsonObject)> cb);
@@ -61,9 +59,6 @@ class ForumService : public QObject {
     static ForumComment parse_comment(const QJsonObject& o);
     static ForumStats parse_stats(const QJsonObject& o);
     static ForumProfile parse_profile(const QJsonObject& o);
-
-    QNetworkAccessManager* nam_ = nullptr;
-    static constexpr const char* BASE = "https://api.fincept.in";
 };
 
 } // namespace fincept::services
