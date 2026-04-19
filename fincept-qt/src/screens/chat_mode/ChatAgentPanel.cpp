@@ -18,7 +18,7 @@ namespace {
 
 bool cloud_features_available() {
     auto& auth = auth::AuthManager::instance();
-    return auth.has_fincept_api_key();
+    return auth.has_local_runtime() || auth.has_fincept_api_key();
 }
 
 void add_placeholder_item(QListWidget* list, const QString& text) {
@@ -541,14 +541,14 @@ void ChatAgentPanel::show_local_mode_placeholders() {
     mcp_servers_.clear();
     monitors_.clear();
 
-    add_placeholder_item(memory_list_, "Fincept Cloud account required.");
-    add_placeholder_item(sched_list_, "Fincept Cloud account required.");
-    add_placeholder_item(task_list_, "Fincept Cloud account required.");
-    add_placeholder_item(mcp_list_, "Fincept Cloud account required.");
-    add_placeholder_item(monitor_list_, "Fincept Cloud account required.");
+    add_placeholder_item(memory_list_, "Connect Codex OAuth or Fincept API.");
+    add_placeholder_item(sched_list_, "Connect Codex OAuth or Fincept API.");
+    add_placeholder_item(task_list_, "Connect Codex OAuth or Fincept API.");
+    add_placeholder_item(mcp_list_, "Connect Codex OAuth or Fincept API.");
+    add_placeholder_item(monitor_list_, "Connect Codex OAuth or Fincept API.");
 
-    task_status_lbl_->setText("Fincept Cloud agent features require a signed-in Fincept session.");
-    mcp_tools_lbl_->setText("Fincept Cloud account required.");
+    task_status_lbl_->setText("Agent features need Codex OAuth or a Fincept API key.");
+    mcp_tools_lbl_->setText("Connect Codex OAuth or Fincept API.");
 
     mem_add_btn_->setEnabled(false);
     mem_del_btn_->setEnabled(false);

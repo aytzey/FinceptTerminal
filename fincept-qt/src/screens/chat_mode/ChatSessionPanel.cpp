@@ -20,17 +20,14 @@ namespace {
 
 bool cloud_sessions_available() {
     auto& auth = auth::AuthManager::instance();
-    return auth.has_fincept_api_key();
+    return auth.has_local_runtime() || auth.has_fincept_api_key();
 }
 
 } // namespace
 
 ChatSessionPanel::ChatSessionPanel(QWidget* parent) : QWidget(parent) {
     build_ui();
-    if (cloud_sessions_available())
-        refresh_sessions();
-    else
-        show_local_mode_placeholder();
+    refresh_sessions();
 }
 
 void ChatSessionPanel::build_ui() {
@@ -175,6 +172,11 @@ void ChatSessionPanel::refresh_sessions() {
 
 void ChatSessionPanel::populate_list(const QVector<ChatSession>& sessions) {
     session_list_->clear();
+    if (sessions.isEmpty()) {
+        auto* item = new QListWidgetItem("No conversations yet.");
+        item->setFlags(item->flags() & ~Qt::ItemIsEnabled);
+        session_list_->addItem(item);
+    }
     for (const auto& s : sessions) {
         auto* item = new QListWidgetItem(session_list_);
         const QString display = s.title.isEmpty() ? "(Untitled)" : s.title;
@@ -225,10 +227,10 @@ void ChatSessionPanel::show_local_mode_placeholder() {
     sessions_.clear();
     active_uuid_.clear();
     session_list_->clear();
-    auto* item = new QListWidgetItem("Fincept Cloud account required.");
+    auto* item = new QListWidgetItem("Connect Codex OAuth or Fincept API to use Chat Mode.");
     item->setFlags(item->flags() & ~Qt::ItemIsEnabled);
     session_list_->addItem(item);
-    stats_lbl_->setText("Local Codex mode");
+    stats_lbl_->setText("No local runtime");
     search_edit_->setEnabled(false);
     new_btn_->setEnabled(false);
     delete_btn_->setEnabled(false);

@@ -189,6 +189,8 @@ class ChatModeService : public QObject {
     QNetworkAccessManager* sse_nam_ = nullptr; // dedicated for SSE stream
     QNetworkReply* sse_reply_ = nullptr;       // active agent SSE connection
     QString sse_current_event_;                // tracks "event:" field
+    quint64 local_stream_generation_ = 0;
+    bool local_stream_active_ = false;
 
     QNetworkReply* task_sse_reply_ = nullptr; // active task activity SSE
     QString task_sse_event_;

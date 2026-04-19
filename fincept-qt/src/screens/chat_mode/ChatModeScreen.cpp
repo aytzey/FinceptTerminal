@@ -103,11 +103,10 @@ void ChatModeScreen::wire_signals() {
 void ChatModeScreen::showEvent(QShowEvent* e) {
     QWidget::showEvent(e);
     auto& auth = auth::AuthManager::instance();
-    if (auth.is_local_mode() && !auth.has_fincept_api_key()) {
-        LOG_INFO("ChatModeScreen", "Local Codex mode — skipping Fincept Chat Mode cloud startup");
-        return;
-    }
-    LOG_INFO("ChatModeScreen", "Entered chat mode");
+    if (auth.has_local_runtime())
+        LOG_INFO("ChatModeScreen", "Entered chat mode (local Codex runtime)");
+    else
+        LOG_INFO("ChatModeScreen", "Entered chat mode");
     session_panel_->refresh_sessions();
     agent_panel_->refresh_memory();
     agent_panel_->refresh_schedules();
