@@ -20,6 +20,39 @@ using namespace fincept::auth;
 
 static constexpr int kTimeoutMs = 15000;
 
+static bool local_runtime_enabled() {
+    return AuthManager::instance().has_local_runtime();
+}
+
+static QJsonObject local_profile_data() {
+    const auto& sess = AuthManager::instance().session();
+    const QString username = sess.user_info.username.isEmpty() ? QStringLiteral("local_user") : sess.user_info.username;
+    return QJsonObject{{"username", username},
+                       {"email", sess.user_info.email},
+                       {"account_type", "local-codex"},
+                       {"credit_balance", 0},
+                       {"is_verified", true},
+                       {"mfa_enabled", false},
+                       {"phone", sess.user_info.phone},
+                       {"country", sess.user_info.country},
+                       {"created_at", sess.user_info.created_at},
+                       {"last_login_at", sess.user_info.last_login_at},
+                       {"local_runtime", true},
+                       {"fincept_cloud_fallback", false}};
+}
+
+static QJsonObject local_subscription_data() {
+    return QJsonObject{{"account_type", "local-codex"},
+                       {"credit_balance", 0},
+                       {"credits_expire_at", QJsonValue()},
+                       {"support_type", "local"},
+                       {"features",
+                        QJsonArray{"Codex OAuth chat", "local news analysis", "local QuantLib subset",
+                                   "local forum store", "local MCP tools"}},
+                       {"local_runtime", true},
+                       {"fincept_cloud_fallback", false}};
+}
+
 // ── Sync helper for UserApi callbacks ────────────────────────────────────────
 
 static ToolResult run_user_api(std::function<void(UserApi::Callback)> trigger) {
@@ -74,6 +107,8 @@ std::vector<ToolDef> get_profile_tools() {
         t.category = "profile";
         t.input_schema.properties = QJsonObject{};
         t.handler = [](const QJsonObject&) -> ToolResult {
+            if (local_runtime_enabled())
+                return ToolResult::ok_data(local_profile_data());
             return run_user_api([](auto cb) { UserApi::instance().get_user_profile(cb); });
         };
         tools.push_back(std::move(t));
@@ -92,6 +127,8 @@ std::vector<ToolDef> get_profile_tools() {
             {"country", QJsonObject{{"type", "string"}, {"description", "Country name"}}},
         };
         t.handler = [](const QJsonObject& args) -> ToolResult {
+            if (local_runtime_enabled())
+                return ToolResult::fail("Profile updates are local-only in Codex runtime; Fincept Cloud fallback is disabled");
             QJsonObject body;
             if (args.contains("username") && !args["username"].toString().isEmpty())
                 body["username"] = args["username"].toString();
@@ -116,6 +153,15 @@ std::vector<ToolDef> get_profile_tools() {
         t.category = "profile";
         t.input_schema.properties = QJsonObject{};
         t.handler = [](const QJsonObject&) -> ToolResult {
+            if (local_runtime_enabled()) {
+                const auto& sess = AuthManager::instance().session();
+                return ToolResult::ok_data(QJsonObject{{"authenticated", sess.authenticated},
+                                                       {"username", local_profile_data().value("username").toString()},
+                                                       {"account_type", "local-codex"},
+                                                       {"credit_balance", 0},
+                                                       {"local_runtime", true},
+                                                       {"fincept_cloud_fallback", false}});
+            }
             const auto& sess = AuthManager::instance().session();
             if (!sess.authenticated)
                 return ToolResult::fail("Not authenticated");
@@ -132,6 +178,8 @@ std::vector<ToolDef> get_profile_tools() {
         t.category = "profile";
         t.input_schema.properties = QJsonObject{};
         t.handler = [](const QJsonObject&) -> ToolResult {
+            if (local_runtime_enabled())
+                return ToolResult::fail("Fincept API key access is disabled in local Codex runtime");
             auto& auth = AuthManager::instance();
             const auto& sess = auth.session();
             if (!sess.authenticated)
@@ -153,6 +201,8 @@ std::vector<ToolDef> get_profile_tools() {
         t.category = "profile";
         t.input_schema.properties = QJsonObject{};
         t.handler = [](const QJsonObject&) -> ToolResult {
+            if (local_runtime_enabled())
+                return ToolResult::fail("API key regeneration requires Fincept Cloud; fallback is disabled in local runtime");
             return run_user_api([](auto cb) { UserApi::instance().regenerate_api_key(cb); });
         };
         tools.push_back(std::move(t));
@@ -170,6 +220,11 @@ std::vector<ToolDef> get_profile_tools() {
             {"offset", QJsonObject{{"type", "integer"}, {"description", "Offset for pagination (default: 0)"}}},
         };
         t.handler = [](const QJsonObject& args) -> ToolResult {
+            if (local_runtime_enabled())
+                return ToolResult::ok_data(QJsonObject{{"items", QJsonArray{}},
+                                                       {"total", 0},
+                                                       {"local_runtime", true},
+                                                       {"fincept_cloud_fallback", false}});
             int limit = args["limit"].toInt(20);
             int offset = args["offset"].toInt(0);
             return run_user_api([limit, offset](auto cb) { UserApi::instance().get_login_history(limit, offset, cb); });
@@ -185,6 +240,8 @@ std::vector<ToolDef> get_profile_tools() {
         t.category = "profile";
         t.input_schema.properties = QJsonObject{};
         t.handler = [](const QJsonObject&) -> ToolResult {
+            if (local_runtime_enabled())
+                return ToolResult::fail("MFA changes require Fincept Cloud; fallback is disabled in local runtime");
             return run_user_api([](auto cb) { UserApi::instance().enable_mfa(cb); });
         };
         tools.push_back(std::move(t));
@@ -198,6 +255,8 @@ std::vector<ToolDef> get_profile_tools() {
         t.category = "profile";
         t.input_schema.properties = QJsonObject{};
         t.handler = [](const QJsonObject&) -> ToolResult {
+            if (local_runtime_enabled())
+                return ToolResult::fail("MFA changes require Fincept Cloud; fallback is disabled in local runtime");
             return run_user_api([](auto cb) { UserApi::instance().disable_mfa(cb); });
         };
         tools.push_back(std::move(t));
@@ -215,6 +274,15 @@ std::vector<ToolDef> get_profile_tools() {
             {"days", QJsonObject{{"type", "integer"}, {"description", "Number of days to look back (default: 30)"}}},
         };
         t.handler = [](const QJsonObject& args) -> ToolResult {
+            if (local_runtime_enabled())
+                return ToolResult::ok_data(QJsonObject{{"summary",
+                                                        QJsonObject{{"total_requests", 0},
+                                                                    {"credits_used", 0},
+                                                                    {"avg_response_time_ms", 0}}},
+                                                       {"daily", QJsonArray{}},
+                                                       {"top_endpoints", QJsonArray{}},
+                                                       {"local_runtime", true},
+                                                       {"fincept_cloud_fallback", false}});
             int days = args["days"].toInt(30);
             return run_user_api([days](auto cb) { UserApi::instance().get_user_usage(days, cb); });
         };
@@ -229,6 +297,10 @@ std::vector<ToolDef> get_profile_tools() {
         t.category = "profile";
         t.input_schema.properties = QJsonObject{};
         t.handler = [](const QJsonObject&) -> ToolResult {
+            if (local_runtime_enabled())
+                return ToolResult::ok_data(QJsonObject{{"credit_balance", 0},
+                                                       {"local_runtime", true},
+                                                       {"fincept_cloud_fallback", false}});
             return run_user_api([](auto cb) { UserApi::instance().get_user_credits(cb); });
         };
         tools.push_back(std::move(t));
@@ -243,6 +315,8 @@ std::vector<ToolDef> get_profile_tools() {
         t.category = "profile";
         t.input_schema.properties = QJsonObject{};
         t.handler = [](const QJsonObject&) -> ToolResult {
+            if (local_runtime_enabled())
+                return ToolResult::ok_data(local_subscription_data());
             return run_user_api([](auto cb) { UserApi::instance().get_user_subscription(cb); });
         };
         tools.push_back(std::move(t));
@@ -260,6 +334,11 @@ std::vector<ToolDef> get_profile_tools() {
             {"limit", QJsonObject{{"type", "integer"}, {"description", "Items per page (default: 20)"}}},
         };
         t.handler = [](const QJsonObject& args) -> ToolResult {
+            if (local_runtime_enabled())
+                return ToolResult::ok_data(QJsonObject{{"payments", QJsonArray{}},
+                                                       {"total", 0},
+                                                       {"local_runtime", true},
+                                                       {"fincept_cloud_fallback", false}});
             int page = args["page"].toInt(1);
             int limit = args["limit"].toInt(20);
             return run_user_api([page, limit](auto cb) { UserApi::instance().get_payment_history(page, limit, cb); });

@@ -49,6 +49,10 @@ static constexpr const char* CODEX_FALLBACK_TOKEN_URL = "https://auth0.openai.co
 static constexpr const char* CODEX_DEFAULT_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 static constexpr int CODEX_MAX_TOOL_ROUNDS = 5;
 
+bool local_runtime_disables_fincept_cloud() {
+    return auth::AuthManager::instance().has_local_runtime();
+}
+
 struct CodexAuthStateData {
     QString path;
     QJsonObject raw_json;
@@ -570,27 +574,34 @@ void LlmService::ensure_config() const {
         }
     }
 
-    if (provider_ == "fincept" && auth::AuthManager::instance().is_local_mode() && has_codex_oauth_auth()) {
-        provider_ = CODEX_PROVIDER;
-        api_key_.clear();
-        base_url_.clear();
-        if (model_.trimmed().isEmpty() || model_ == "fincept-llm" || model_ == "gpt-5.3-codex")
-            model_ = "gpt-5.4";
-        if (reasoning_effort_.trimmed().isEmpty())
-            reasoning_effort_ = "high";
+    if (provider_ == "fincept" && local_runtime_disables_fincept_cloud()) {
+        if (has_codex_oauth_auth()) {
+            provider_ = CODEX_PROVIDER;
+            api_key_.clear();
+            base_url_.clear();
+            if (model_.trimmed().isEmpty() || model_ == "fincept-llm" || model_ == "gpt-5.3-codex")
+                model_ = "gpt-5.4";
+            if (reasoning_effort_.trimmed().isEmpty())
+                reasoning_effort_ = "high";
 
-        LlmConfig codex_cfg;
-        codex_cfg.provider = CODEX_PROVIDER;
-        codex_cfg.base_url = CODEX_DEFAULT_BASE_URL;
-        codex_cfg.model = model_;
-        codex_cfg.reasoning_effort = reasoning_effort_;
-        codex_cfg.is_active = true;
-        codex_cfg.tools_enabled = tools_enabled_;
-        const auto saved = LlmConfigRepository::instance().save_provider(codex_cfg);
-        if (saved.is_ok())
-            LlmConfigRepository::instance().set_active(CODEX_PROVIDER);
+            LlmConfig codex_cfg;
+            codex_cfg.provider = CODEX_PROVIDER;
+            codex_cfg.base_url = CODEX_DEFAULT_BASE_URL;
+            codex_cfg.model = model_;
+            codex_cfg.reasoning_effort = reasoning_effort_;
+            codex_cfg.is_active = true;
+            codex_cfg.tools_enabled = tools_enabled_;
+            const auto saved = LlmConfigRepository::instance().save_provider(codex_cfg);
+            if (saved.is_ok())
+                LlmConfigRepository::instance().set_active(CODEX_PROVIDER);
 
-        LOG_INFO(TAG, "Fincept provider bypassed in local mode — using Codex OAuth");
+            LOG_INFO(TAG, "Fincept provider bypassed in local mode — using Codex OAuth");
+        } else {
+            provider_.clear();
+            api_key_.clear();
+            base_url_.clear();
+            LOG_WARN(TAG, "Fincept provider disabled in local runtime; connect Codex OAuth or another local provider");
+        }
     }
 
     // Fincept always resolves API key from session (never stored in llm_configs)
@@ -726,6 +737,8 @@ QString LlmService::get_endpoint_url() const {
     // Fincept: two endpoints — sync chat and async LLM
     // base_url_ stores the base domain; append path here.
     if (p == "fincept") {
+        if (local_runtime_disables_fincept_cloud())
+            return {};
         // sync endpoint for chat (short replies)
         return "https://api.fincept.in/research/chat";
     }
@@ -780,6 +793,8 @@ QMap<QString, QString> LlmService::get_headers() const {
         if (!api_key_.isEmpty())
             h["x-goog-api-key"] = api_key_;
     } else if (p == "fincept") {
+        if (local_runtime_disables_fincept_cloud())
+            return h;
         // api_key_ already resolved from session by ensure_config()
         if (!api_key_.isEmpty())
             h["X-API-Key"] = api_key_;
@@ -1115,6 +1130,12 @@ static QString build_tool_catalog_for_prompt() {
 LlmResponse LlmService::fincept_async_request(const QString& user_message,
                                               const std::vector<ConversationMessage>& history) {
     LlmResponse resp;
+    if (local_runtime_disables_fincept_cloud()) {
+        Q_UNUSED(user_message)
+        Q_UNUSED(history)
+        resp.error = "Fincept LLM Cloud is disabled in local Codex runtime";
+        return resp;
+    }
 
     // Build prompt string for the async endpoint (it takes a plain prompt, not messages)
     QString prompt;
@@ -2518,8 +2539,11 @@ QString LlmService::get_models_url(const QString& provider, const QString& api_k
             base.chop(1);
         return base + "/api/tags";
     }
-    if (p == "fincept")
+    if (p == "fincept") {
+        if (local_runtime_disables_fincept_cloud())
+            return {};
         return "https://api.fincept.in/research/llm/models";
+    }
     // minimax: no public /v1/models endpoint — fallback models used instead
     return {};
 }
@@ -2539,6 +2563,8 @@ QMap<QString, QString> LlmService::get_models_headers(const QString& provider, c
     } else if (p == "ollama") {
         // No auth needed
     } else if (p == "fincept") {
+        if (local_runtime_disables_fincept_cloud())
+            return h;
         // Resolve API key from session (same logic as ensure_config)
         QString resolved_key = api_key;
         if (resolved_key.isEmpty()) {
@@ -2629,6 +2655,11 @@ QStringList LlmService::parse_models_response(const QString& provider, const QBy
 }
 
 void LlmService::fetch_models(const QString& provider, const QString& api_key, const QString& base_url) {
+    if (provider.toLower() == "fincept" && local_runtime_disables_fincept_cloud()) {
+        emit models_fetched(provider, {}, "Fincept Cloud models are disabled in local Codex runtime");
+        return;
+    }
+
     // Fincept has no public /models listing endpoint — return known models immediately.
     if (provider.toLower() == "fincept") {
         emit models_fetched(provider,

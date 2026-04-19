@@ -865,16 +865,7 @@ void MainWindow::setup_dock_screens() {
     dock_router_->register_factory("markets", []() { return new screens::MarketsScreen; });
     dock_router_->register_factory("crypto_trading", []() { return new screens::CryptoTradingScreen; });
     dock_router_->register_factory("news", []() { return new screens::NewsScreen; });
-    dock_router_->register_factory("forum", []() -> QWidget* {
-        auto& auth = auth::AuthManager::instance();
-        if (auth.is_local_mode() && !auth.has_fincept_api_key()) {
-            return make_cloud_feature_notice(
-                "FORUM",
-                "Local Codex mode is active. Add a Fincept API key to unlock the community forum without switching out "
-                "of the local workflow.");
-        }
-        return new screens::ForumScreen;
-    });
+    dock_router_->register_factory("forum", []() { return new screens::ForumScreen; });
     dock_router_->register_factory("watchlist", []() { return new screens::WatchlistScreen; });
 
     // Lazily constructed on first navigation — deferred to avoid startup cost.
