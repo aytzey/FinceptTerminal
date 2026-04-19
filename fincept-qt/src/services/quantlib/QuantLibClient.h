@@ -1,5 +1,5 @@
 #pragma once
-// QuantLibClient.h — Shared HTTP client for all QuantLib API calls.
+// QuantLibClient.h — Shared local QuantLib engine for all QuantLib calls.
 // Used by QuantLibScreen (async) and MCP QuantLibTools (sync-wrapped).
 
 #include "mcp/McpTypes.h"
@@ -21,29 +21,17 @@ class QuantLibClient : public QObject {
   public:
     static QuantLibClient& instance();
 
-    /// Async call — callback posted on Qt event loop (use from UI thread).
+    /// Local call; callback is delivered immediately with the local engine result.
     void call(const QString& endpoint, const QJsonObject& body, QuantLibCallback callback);
 
-    /// Sync call — blocks via QEventLoop (use from MCP tool handlers only, never from UI thread).
+    /// Sync call for MCP tool handlers.
     mcp::ToolResult call_sync(const QString& endpoint, const QJsonObject& body);
-
-    static const QString API_BASE;
-
-    /// GET-only endpoints (no request body).
-    static bool is_get_endpoint(const QString& endpoint);
-
-    /// Query-param endpoints: body fields become URL query params, POST with empty body.
-    static bool is_query_param_endpoint(const QString& endpoint);
 
     QuantLibClient(const QuantLibClient&) = delete;
     QuantLibClient& operator=(const QuantLibClient&) = delete;
 
   private:
     explicit QuantLibClient(QObject* parent = nullptr);
-
-    /// Parses raw HTTP response bytes into a ToolResult, unwrapping the
-    /// {"success", "message", "data"} envelope and handling 422/4xx errors.
-    static mcp::ToolResult parse_response(int http_status, const QByteArray& raw);
 };
 
 } // namespace fincept::services

@@ -514,7 +514,7 @@ void QuantLibScreen::on_execute() {
 
 // ── Data ────────────────────────────────────────────────────────────────────
 
-// Real API endpoint paths per module (from api.fincept.in OpenAPI spec)
+// Local QuantLib endpoint paths per module.
 static const QHash<QString, QStringList> MODULE_ENDPOINTS = {
     {"core",
      {"core/types/currencies",
