@@ -4,15 +4,19 @@
 #include "auth/AuthManager.h"
 #include "core/logging/Logger.h"
 #include "network/http/HttpClient.h"
+#include "python/PythonRunner.h"
 #include "storage/cache/CacheManager.h"
 
 #    include "datahub/DataHub.h"
 #    include "datahub/DataHubMetaTypes.h"
 
+#include <QDate>
+#include <QDateTime>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QPointer>
+#include <QProcessEnvironment>
 
 namespace fincept::services::maritime {
 
@@ -28,7 +32,86 @@ bool local_maritime_enabled() {
 
 QString local_unavailable_message() {
     return QStringLiteral("Local maritime AIS provider is not configured. Fincept Cloud fallback is disabled; "
-                          "use cached vessel data or configure an open AIS provider.");
+                          "use cached vessel data or set AISSTREAM_API_KEY, MARINETRAFFIC_API_KEY, or GFW_API_KEY.");
+}
+
+bool has_env(const QString& key) {
+    return !QProcessEnvironment::systemEnvironment().value(key).trimmed().isEmpty();
+}
+
+double json_number(const QJsonObject& obj, std::initializer_list<const char*> keys, double fallback = 0.0) {
+    for (const char* key : keys) {
+        const auto value = obj.value(QString::fromLatin1(key));
+        if (value.isDouble())
+            return value.toDouble();
+        if (value.isString()) {
+            bool ok = false;
+            const double parsed = value.toString().toDouble(&ok);
+            if (ok)
+                return parsed;
+        }
+    }
+    return fallback;
+}
+
+QString json_string(const QJsonObject& obj, std::initializer_list<const char*> keys) {
+    for (const char* key : keys) {
+        const auto value = obj.value(QString::fromLatin1(key));
+        if (value.isString() && !value.toString().trimmed().isEmpty())
+            return value.toString().trimmed();
+        if (value.isDouble())
+            return QString::number(value.toDouble(), 'f', 0);
+    }
+    return {};
+}
+
+QJsonDocument parse_python_json(const fincept::python::PythonResult& result, QString* error = nullptr) {
+    if (!result.success) {
+        if (error)
+            *error = result.error.isEmpty() ? QStringLiteral("Python provider failed") : result.error;
+        return {};
+    }
+    QJsonParseError parse_error;
+    const QString json = fincept::python::extract_json(result.output);
+    const auto doc = QJsonDocument::fromJson(json.toUtf8(), &parse_error);
+    if (parse_error.error != QJsonParseError::NoError && error)
+        *error = QStringLiteral("Provider returned invalid JSON: ") + parse_error.errorString();
+    return doc;
+}
+
+QJsonArray first_array_payload(const QJsonValue& value) {
+    if (value.isArray())
+        return value.toArray();
+    if (!value.isObject())
+        return {};
+    const QJsonObject obj = value.toObject();
+    for (const QString& key : {"vessels", "results", "data", "tracks", "positions", "history", "features"}) {
+        if (obj.value(key).isArray())
+            return obj.value(key).toArray();
+    }
+    return {};
+}
+
+QJsonObject first_object_payload(const QJsonValue& value) {
+    if (value.isObject()) {
+        const QJsonObject obj = value.toObject();
+        if (obj.contains("error"))
+            return {};
+        for (const QString& key : {"vessel", "data", "result"}) {
+            if (obj.value(key).isObject())
+                return obj.value(key).toObject();
+        }
+        const QJsonArray arr = first_array_payload(obj);
+        if (!arr.isEmpty() && arr.first().isObject())
+            return arr.first().toObject();
+        return obj;
+    }
+    if (value.isArray()) {
+        const QJsonArray arr = value.toArray();
+        if (!arr.isEmpty() && arr.first().isObject())
+            return arr.first().toObject();
+    }
+    return {};
 }
 }  // namespace
 
@@ -65,6 +148,167 @@ VesselData MaritimeService::parse_vessel(const QJsonObject& obj) const {
     return v;
 }
 
+VesselData MaritimeService::parse_local_vessel(const QJsonObject& obj) const {
+    QJsonObject src = obj;
+    if (obj.value("properties").isObject())
+        src = obj.value("properties").toObject();
+    if (obj.value("registryInfo").isObject()) {
+        QJsonObject merged = obj.value("registryInfo").toObject();
+        for (auto it = obj.begin(); it != obj.end(); ++it)
+            merged.insert(it.key(), it.value());
+        src = merged;
+    }
+
+    VesselData v;
+    v.id = static_cast<int>(json_number(src, {"id", "vesselId"}, 0.0));
+    v.imo = json_string(src, {"imo", "IMO", "imoNumber", "ssvid", "mmsi", "MMSI"});
+    v.name = json_string(src, {"name", "vessel_name", "shipname", "SHIPNAME", "vesselName", "callsign"});
+    v.latitude = json_number(src, {"lat", "latitude", "LAT", "last_pos_latitude"});
+    v.longitude = json_number(src, {"lon", "lng", "longitude", "LON", "last_pos_longitude"});
+    v.speed = json_number(src, {"speed", "sog", "SOG", "last_pos_speed"});
+    v.angle = json_number(src, {"course", "cog", "COG", "heading", "last_pos_angle"});
+    v.from_port = json_string(src, {"from_port", "route_from_port_name", "origin"});
+    v.to_port = json_string(src, {"to_port", "route_to_port_name", "destination"});
+    v.from_date = json_string(src, {"from_date", "route_from_date", "startDate"});
+    v.to_date = json_string(src, {"to_date", "route_to_date", "endDate"});
+    v.draught = json_number(src, {"draught", "DRAUGHT", "current_draught"});
+    v.last_updated = json_string(src, {"timestamp", "last_timestamp", "last_pos_updated_at", "date"});
+    v.fetched_at = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+    return v;
+}
+
+bool MaritimeService::try_local_area_provider(const AreaSearchParams& params) {
+    if (!has_env("AISSTREAM_API_KEY"))
+        return false;
+
+    QPointer<MaritimeService> self = this;
+    const QStringList args = {"area",
+                              QString::number(params.min_lat, 'f', 6),
+                              QString::number(params.min_lng, 'f', 6),
+                              QString::number(params.max_lat, 'f', 6),
+                              QString::number(params.max_lng, 'f', 6)};
+    python::PythonRunner::instance().run("aisstream_data.py", args, [self](python::PythonResult result) {
+        if (!self)
+            return;
+        QString error;
+        const QJsonDocument doc = parse_python_json(result, &error);
+        if (!error.isEmpty()) {
+            emit self->error_occurred("area_search", error);
+            return;
+        }
+        const QJsonArray arr = first_array_payload(doc.isArray() ? QJsonValue(doc.array()) : QJsonValue(doc.object()));
+        QVector<VesselData> vessels;
+        QJsonArray cache_arr;
+        vessels.reserve(arr.size());
+        for (const auto& value : arr) {
+            if (!value.isObject())
+                continue;
+            const VesselData vessel = self->parse_local_vessel(value.toObject());
+            if (!vessel.imo.isEmpty() || !vessel.name.isEmpty()) {
+                vessels.append(vessel);
+                cache_arr.append(value.toObject());
+            }
+        }
+        if (vessels.isEmpty()) {
+            emit self->error_occurred("area_search", "AISStream returned no vessels for this area.");
+            return;
+        }
+        fincept::CacheManager::instance().put(
+            "maritime:local:area:last",
+            QVariant(QString::fromUtf8(QJsonDocument(cache_arr).toJson(QJsonDocument::Compact))),
+            kVesselTtlSec, "maritime");
+        emit self->vessels_loaded(vessels, vessels.size());
+        if (self->hub_registered_)
+            publish_to_hub(QStringLiteral("maritime:vessels:multi"), QVariant::fromValue(vessels));
+    });
+    return true;
+}
+
+bool MaritimeService::try_local_vessel_provider(const QString& id) {
+    QString script;
+    QStringList args;
+    QString provider;
+    if (has_env("AISSTREAM_API_KEY")) {
+        script = "aisstream_data.py";
+        args = {"vessel", id.trimmed()};
+        provider = "aisstream";
+    } else if (has_env("MARINETRAFFIC_API_KEY")) {
+        script = "marinetraffic_data.py";
+        args = {"positions", id.trimmed()};
+        provider = "marinetraffic";
+    } else {
+        return false;
+    }
+
+    QPointer<MaritimeService> self = this;
+    const QString cache_key = "maritime:vessel:" + id.trimmed();
+    python::PythonRunner::instance().run(script, args, [self, cache_key, provider, id](python::PythonResult result) {
+        if (!self)
+            return;
+        QString error;
+        const QJsonDocument doc = parse_python_json(result, &error);
+        if (!error.isEmpty()) {
+            emit self->error_occurred("vessel_position", provider + ": " + error);
+            return;
+        }
+        const QJsonObject obj = first_object_payload(doc.isArray() ? QJsonValue(doc.array()) : QJsonValue(doc.object()));
+        if (obj.isEmpty()) {
+            emit self->error_occurred("vessel_position", provider + " returned no vessel for " + id);
+            return;
+        }
+        fincept::CacheManager::instance().put(
+            cache_key, QVariant(QString::fromUtf8(QJsonDocument(obj).toJson(QJsonDocument::Compact))),
+            kVesselTtlSec, "maritime");
+        const VesselData vessel = self->parse_local_vessel(obj);
+        emit self->vessel_found(vessel);
+        if (self->hub_registered_)
+            publish_to_hub(QStringLiteral("maritime:vessel:") + id.trimmed(), QVariant::fromValue(vessel));
+    });
+    return true;
+}
+
+bool MaritimeService::try_local_history_provider(const QString& id) {
+    if (!has_env("AISSTREAM_API_KEY"))
+        return false;
+    const QDate end = QDate::currentDate();
+    const QDate start = end.addDays(-30);
+    QPointer<MaritimeService> self = this;
+    const QString cache_key = "maritime:history:" + id.trimmed();
+    python::PythonRunner::instance().run(
+        "aisstream_data.py", {"track", id.trimmed(), start.toString(Qt::ISODate), end.toString(Qt::ISODate)},
+        [self, cache_key, id](python::PythonResult result) {
+            if (!self)
+                return;
+            QString error;
+            const QJsonDocument doc = parse_python_json(result, &error);
+            if (!error.isEmpty()) {
+                emit self->error_occurred("vessel_history", "aisstream: " + error);
+                return;
+            }
+            const QJsonArray arr = first_array_payload(doc.isArray() ? QJsonValue(doc.array()) : QJsonValue(doc.object()));
+            QVector<VesselData> history;
+            QJsonArray cache_arr;
+            history.reserve(arr.size());
+            for (const auto& value : arr) {
+                if (!value.isObject())
+                    continue;
+                history.append(self->parse_local_vessel(value.toObject()));
+                cache_arr.append(value.toObject());
+            }
+            if (history.isEmpty()) {
+                emit self->error_occurred("vessel_history", "AISStream returned no track points for " + id);
+                return;
+            }
+            fincept::CacheManager::instance().put(
+                cache_key, QVariant(QString::fromUtf8(QJsonDocument(cache_arr).toJson(QJsonDocument::Compact))),
+                kHistoryTtlSec, "maritime");
+            emit self->vessel_history_loaded(history);
+            if (self->hub_registered_)
+                publish_to_hub(QStringLiteral("maritime:history:") + id.trimmed(), QVariant::fromValue(history));
+        });
+    return true;
+}
+
 // ── Helper: unwrap {success, data: {...}} envelope ──────────────────────────
 static QJsonObject unwrap(const QJsonObject& root) {
     if (root.contains("data") && root["data"].isObject())
@@ -74,8 +318,9 @@ static QJsonObject unwrap(const QJsonObject& root) {
 
 // ── Area search (uses multi-vessel with well-known port IMOs) ────────────────
 void MaritimeService::search_vessels_by_area(const AreaSearchParams& params) {
-    Q_UNUSED(params);
     if (local_maritime_enabled()) {
+        if (try_local_area_provider(params))
+            return;
         emit error_occurred("area_search", local_unavailable_message());
         return;
     }
@@ -111,6 +356,8 @@ void MaritimeService::get_vessel_position(const QString& imo) {
     }
 
     if (local_maritime_enabled()) {
+        if (try_local_vessel_provider(imo.trimmed()))
+            return;
         emit error_occurred("vessel_position", local_unavailable_message());
         return;
     }
@@ -172,6 +419,11 @@ void MaritimeService::get_multi_vessel_positions(const QStringList& imos) {
                 publish_to_hub(QStringLiteral("maritime:vessels:multi"), QVariant::fromValue(vessels));
             return;
         }
+        if (has_env("AISSTREAM_API_KEY")) {
+            AreaSearchParams params;
+            if (try_local_area_provider(params))
+                return;
+        }
         emit error_occurred("multi_vessel", local_unavailable_message());
         return;
     }
@@ -224,6 +476,8 @@ void MaritimeService::get_vessel_history(const QString& imo) {
     }
 
     if (local_maritime_enabled()) {
+        if (try_local_history_provider(imo.trimmed()))
+            return;
         emit error_occurred("vessel_history", local_unavailable_message());
         return;
     }
@@ -265,6 +519,9 @@ void MaritimeService::check_health() {
     if (local_maritime_enabled()) {
         QJsonObject obj{{"status", "local"},
                         {"provider", "cache_or_open_ais"},
+                        {"aisstream_configured", has_env("AISSTREAM_API_KEY")},
+                        {"marinetraffic_configured", has_env("MARINETRAFFIC_API_KEY")},
+                        {"gfw_configured", has_env("GFW_API_KEY")},
                         {"fincept_cloud_fallback", false},
                         {"message", local_unavailable_message()}};
         emit health_loaded(obj);

@@ -369,7 +369,7 @@ QWidget* MaritimeScreen::build_center_panel() {
                              .arg(ui::fonts::DATA_FAMILY));
     hhl->addWidget(title);
     hhl->addStretch();
-    auto* ais_badge = new QLabel("AIS: STREAMING", header);
+    auto* ais_badge = new QLabel("AIS: LOCAL PROVIDER", header);
     ais_badge->setStyleSheet(QString("color:%1; font-size:9px; font-family:%2; font-weight:700;")
                                  .arg(ui::colors::POSITIVE())
                                  .arg(ui::fonts::DATA_FAMILY));
@@ -574,8 +574,8 @@ QWidget* MaritimeScreen::build_right_panel() {
         const ui::ColorToken& color;
     };
     QVector<QPair<QString, QString>> statuses = {
-        {"AIS Transponders", ui::colors::INFO()},
-        {"Satellite Imagery", ui::colors::POSITIVE()},
+        {"AIS provider: env/cache", ui::colors::INFO()},
+        {"Satellite imagery: not connected", ui::colors::TEXT_TERTIARY()},
         {"Trade Routes: 10 corridors", ui::colors::INFO()},
         {"Orbital Tracking: 13 SATs", ui::colors::AMBER()},
         {"Major Ports: 6 monitored", ui::colors::WARNING()},
@@ -623,7 +623,7 @@ QWidget* MaritimeScreen::build_status_bar() {
 
     auto* lbl1 = new QLabel("SOURCE:", bar);
     lbl1->setStyleSheet(s);
-    auto* val1 = new QLabel("AIS FEED + FINCEPT API", bar);
+    auto* val1 = new QLabel("LOCAL AIS / CACHE", bar);
     val1->setStyleSheet(sv);
     hl->addWidget(lbl1);
     hl->addWidget(val1);

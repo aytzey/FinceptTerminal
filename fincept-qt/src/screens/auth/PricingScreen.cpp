@@ -57,7 +57,7 @@ static std::vector<auth::SubscriptionPlan> local_runtime_plans() {
     local.validity_days = 0;
     local.is_free = true;
     local.display_order = 0;
-    local.features = {"Codex OAuth chat", "Local news and geopolitics analysis", "Local QuantLib subset",
+    local.features = {"Codex OAuth chat", "Local news and geopolitics analysis", "Expanded local QuantLib analytics",
                       "Local forum and support store", "Fincept Cloud fallback disabled"};
     return {local};
 }

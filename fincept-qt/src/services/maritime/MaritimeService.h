@@ -52,6 +52,10 @@ class MaritimeService : public QObject
     Q_DISABLE_COPY(MaritimeService)
 
     VesselData parse_vessel(const QJsonObject& obj) const;
+    VesselData parse_local_vessel(const QJsonObject& obj) const;
+    bool try_local_area_provider(const AreaSearchParams& params);
+    bool try_local_vessel_provider(const QString& id);
+    bool try_local_history_provider(const QString& id);
 
     bool hub_registered_ = false;
 };
