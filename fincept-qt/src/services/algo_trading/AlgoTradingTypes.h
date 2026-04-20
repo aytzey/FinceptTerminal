@@ -35,6 +35,8 @@ struct AlgoDeployment {
     QString id;
     QString strategy_id;
     QString strategy_name;
+    QString account_id;
+    QString account_name;
     QString symbol;
     QString mode;   // paper, live
     QString status; // pending, starting, running, stopped, error

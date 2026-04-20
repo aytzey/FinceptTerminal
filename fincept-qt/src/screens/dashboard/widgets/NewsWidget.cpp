@@ -1,11 +1,11 @@
 #include "screens/dashboard/widgets/NewsWidget.h"
 
-#include "services/markets/MarketDataService.h"
 #include "ui/theme/Theme.h"
 
-#include <QJsonArray>
-#include <QJsonObject>
 #include <QLabel>
+#include <QPointer>
+
+#include <memory>
 
 namespace fincept::screens::widgets {
 
@@ -46,20 +46,40 @@ void NewsWidget::on_theme_changed() {
 void NewsWidget::refresh_data() {
     set_loading(true);
 
-    // Fetch news for SPY (broad market news)
-    services::MarketDataService::instance().fetch_news("SPY", 10, [this](bool ok, QJsonArray articles) {
-        set_loading(false);
+    QPointer<NewsWidget> self = this;
+    auto* svc = &services::NewsService::instance();
+    auto partial_conn = std::make_shared<QMetaObject::Connection>();
+    *partial_conn = connect(svc, &services::NewsService::articles_partial, this,
+                            [self, partial_conn](QVector<services::NewsArticle> articles, int, int) {
+                                if (!self)
+                                    return;
+                                if (articles.isEmpty())
+                                    return;
+                                if (articles.size() > 12)
+                                    articles = articles.mid(0, 12);
+                                self->set_loading(false);
+                                self->populate(articles);
+                                QObject::disconnect(*partial_conn);
+                            });
+
+    svc->fetch_all_news_progressive(false, [self, partial_conn](bool ok, QVector<services::NewsArticle> articles) {
+        QObject::disconnect(*partial_conn);
+        if (!self)
+            return;
+        if (articles.size() > 12)
+            articles = articles.mid(0, 12);
+        self->set_loading(false);
         if (!ok || articles.isEmpty()) {
-            if (news_layout_->count() <= 1) {
-                set_error("No news available. Check Python/yfinance.");
+            if (self->news_layout_->count() <= 1) {
+                self->set_error("No news available.");
             }
             return;
         }
-        populate(articles);
+        self->populate(articles);
     });
 }
 
-void NewsWidget::populate(const QJsonArray& articles) {
+void NewsWidget::populate(const QVector<services::NewsArticle>& articles) {
     last_articles_ = articles;
 
     // Clear old items (keep the stretch)
@@ -70,20 +90,13 @@ void NewsWidget::populate(const QJsonArray& articles) {
         delete item;
     }
 
-    for (const auto& val : articles) {
-        auto obj = val.toObject();
-        QString title = obj["title"].toString();
-        QString publisher = obj["publisher"].toString();
-        QString pub_date = obj["published_date"].toString();
-
-        if (title.isEmpty())
+    for (const auto& article : articles) {
+        if (article.headline.isEmpty())
             continue;
 
-        // Extract time portion from date
-        QString time_str;
-        if (pub_date.length() >= 16) {
-            time_str = pub_date.mid(11, 5); // "HH:MM"
-        }
+        QString time_str = services::relative_time(article.sort_ts);
+        if (time_str.isEmpty())
+            time_str = article.time;
 
         auto* row = new QWidget(this);
         row->setStyleSheet(QString("border-bottom: 1px solid %1;").arg(ui::colors::BORDER_DIM()));
@@ -99,14 +112,14 @@ void NewsWidget::populate(const QJsonArray& articles) {
             rl->addWidget(time_lbl);
         }
 
-        auto* headline = new QLabel(title);
+        auto* headline = new QLabel(article.headline);
         headline->setWordWrap(true);
         headline->setStyleSheet(
             QString("color: %1; font-size: 11px; background: transparent;").arg(ui::colors::TEXT_PRIMARY()));
         rl->addWidget(headline, 1);
 
-        if (!publisher.isEmpty()) {
-            auto* src = new QLabel(publisher);
+        if (!article.source.isEmpty()) {
+            auto* src = new QLabel(article.source);
             src->setStyleSheet(
                 QString("color: %1; font-size: 9px; background: transparent;").arg(ui::colors::TEXT_TERTIARY()));
             rl->addWidget(src);

@@ -144,7 +144,7 @@ def fetch_from_candle_cache(db_path: str, symbol: str, timeframe: str, limit: in
             SELECT open_time, o, h, l, c, volume
             FROM candle_cache
             WHERE symbol = ? AND timeframe = ? AND is_closed = 1
-            ORDER BY open_time ASC
+            ORDER BY open_time DESC
             LIMIT ?
         """
         df = pd.read_sql_query(query, conn, params=(symbol, timeframe, limit))
@@ -155,6 +155,8 @@ def fetch_from_candle_cache(db_path: str, symbol: str, timeframe: str, limit: in
         if df.empty:
             return None, f"No data in candle_cache for {symbol} ({timeframe}). Run a scan first to fetch data."
 
+        df.sort_values('open_time', inplace=True)
+        df.reset_index(drop=True, inplace=True)
         df.rename(columns={'o': 'open', 'h': 'high', 'l': 'low', 'c': 'close'}, inplace=True)
         df = df[['open', 'high', 'low', 'close', 'volume']].reset_index(drop=True)
         debug(f"Final DataFrame shape: {df.shape}, first row: {df.iloc[0].to_dict() if len(df) > 0 else 'empty'}")

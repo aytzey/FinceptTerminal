@@ -124,6 +124,8 @@ class CryptoTradingScreen : public QWidget, public IStatefulScreen {
 
     // Async fetch guards
     std::atomic<bool> candles_fetching_{false};
+    std::atomic<bool> orderbook_fetching_{false};
+    std::atomic<bool> watchlist_fetching_{false};
     std::atomic<int> live_inflight_{0};  // counts async_fetch_live_* tasks still running
     std::atomic<bool> paper_bookkeeping_in_flight_{false};
 

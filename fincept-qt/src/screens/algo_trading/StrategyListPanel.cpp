@@ -3,10 +3,12 @@
 
 #include "core/logging/Logger.h"
 #include "services/algo_trading/AlgoTradingService.h"
+#include "trading/AccountManager.h"
 #include "ui/theme/Theme.h"
 
 #include <algorithm>
 
+#include <QDoubleValidator>
 #include <QHeaderView>
 #include <QHBoxLayout>
 #include <QPushButton>
@@ -31,6 +33,10 @@ StrategyListPanel::StrategyListPanel(QWidget* parent) : QWidget(parent) {
 void StrategyListPanel::connect_service() {
     auto& svc = AlgoTradingService::instance();
     connect(&svc, &AlgoTradingService::strategies_loaded, this, &StrategyListPanel::on_strategies_loaded);
+    connect(&svc, &AlgoTradingService::deployment_started, this, [this](const QString& id) {
+        if (deploy_status_)
+            deploy_status_->setText(QString("Deployment started: %1").arg(id.left(8)));
+    });
     connect(&svc, &AlgoTradingService::error_occurred, this, &StrategyListPanel::on_error);
 }
 
@@ -45,11 +51,15 @@ void StrategyListPanel::build_ui() {
 
     // ── Top bar ──────────────────────────────────────────────────────────────
     auto* top_bar = new QWidget(this);
-    top_bar->setFixedHeight(44);
+    top_bar->setFixedHeight(78);
     top_bar->setStyleSheet(QString("background:%1; border-bottom:1px solid %2;")
                                .arg(colors::BG_RAISED(), colors::BORDER_DIM()));
-    auto* top_hl = new QHBoxLayout(top_bar);
-    top_hl->setContentsMargins(12, 0, 12, 0);
+    auto* top_vl = new QVBoxLayout(top_bar);
+    top_vl->setContentsMargins(12, 6, 12, 6);
+    top_vl->setSpacing(5);
+
+    auto* top_hl = new QHBoxLayout;
+    top_hl->setContentsMargins(0, 0, 0, 0);
     top_hl->setSpacing(8);
 
     search_edit_ = new QLineEdit(top_bar);
@@ -78,6 +88,14 @@ void StrategyListPanel::build_ui() {
             .arg(colors::BG_SURFACE(), colors::TEXT_PRIMARY(), colors::BORDER_DIM())
             .arg(fonts::TINY)
             .arg(fonts::DATA_FAMILY(), colors::BG_HOVER());
+    const QString btn_style =
+        QString("QPushButton { background:%1; color:%2; border:1px solid %3;"
+                " font-size:%4px; font-family:%5; padding:2px 12px; }"
+                "QPushButton:hover { border-color:%6; color:%6; }"
+                "QPushButton:disabled { color:%3; border-color:%3; }")
+            .arg(colors::BG_SURFACE(), colors::TEXT_PRIMARY(), colors::BORDER_DIM())
+            .arg(fonts::TINY)
+            .arg(fonts::DATA_FAMILY(), colors::CYAN());
     cat_combo_->setStyleSheet(combo_style);
     top_hl->addWidget(cat_combo_);
 
@@ -104,6 +122,72 @@ void StrategyListPanel::build_ui() {
                                     .arg(fonts::TINY)
                                     .arg(fonts::DATA_FAMILY()));
     top_hl->addWidget(count_label_);
+
+    top_vl->addLayout(top_hl);
+
+    auto* deploy_hl = new QHBoxLayout;
+    deploy_hl->setContentsMargins(0, 0, 0, 0);
+    deploy_hl->setSpacing(8);
+
+    auto* deploy_lbl = new QLabel("DEPLOY:", top_bar);
+    deploy_lbl->setStyleSheet(QString("color:%1; font-size:%2px; font-weight:700; font-family:%3;"
+                                      " background:transparent; border:none;")
+                                  .arg(colors::AMBER())
+                                  .arg(fonts::TINY)
+                                  .arg(fonts::DATA_FAMILY()));
+    deploy_hl->addWidget(deploy_lbl);
+
+    deploy_symbol_ = new QLineEdit(top_bar);
+    deploy_symbol_->setPlaceholderText("SYMBOL");
+    deploy_symbol_->setFixedHeight(26);
+    deploy_symbol_->setFixedWidth(120);
+    deploy_symbol_->setStyleSheet(search_edit_->styleSheet());
+    deploy_hl->addWidget(deploy_symbol_);
+
+    deploy_tf_ = new QComboBox(top_bar);
+    deploy_tf_->addItems(algo_timeframes());
+    deploy_tf_->setCurrentText("5m");
+    deploy_tf_->setFixedHeight(26);
+    deploy_tf_->setFixedWidth(86);
+    deploy_tf_->setStyleSheet(combo_style);
+    deploy_hl->addWidget(deploy_tf_);
+
+    deploy_qty_ = new QLineEdit(top_bar);
+    deploy_qty_->setText("1");
+    deploy_qty_->setValidator(new QDoubleValidator(0.00000001, 1000000000.0, 8, deploy_qty_));
+    deploy_qty_->setFixedHeight(26);
+    deploy_qty_->setFixedWidth(80);
+    deploy_qty_->setStyleSheet(search_edit_->styleSheet());
+    deploy_hl->addWidget(deploy_qty_);
+
+    deploy_mode_ = new QComboBox(top_bar);
+    deploy_mode_->addItems({"paper", "live"});
+    deploy_mode_->setFixedHeight(26);
+    deploy_mode_->setFixedWidth(86);
+    deploy_mode_->setStyleSheet(combo_style);
+    deploy_hl->addWidget(deploy_mode_);
+
+    deploy_account_ = new QComboBox(top_bar);
+    deploy_account_->setFixedHeight(26);
+    deploy_account_->setMinimumWidth(220);
+    deploy_account_->setStyleSheet(combo_style);
+    deploy_hl->addWidget(deploy_account_);
+
+    deploy_btn_ = new QPushButton("START BOT", top_bar);
+    deploy_btn_->setCursor(Qt::PointingHandCursor);
+    deploy_btn_->setFixedHeight(26);
+    deploy_btn_->setStyleSheet(btn_style);
+    deploy_hl->addWidget(deploy_btn_);
+
+    deploy_status_ = new QLabel("Select a strategy row first.", top_bar);
+    deploy_status_->setStyleSheet(QString("color:%1; font-size:%2px; font-family:%3;"
+                                          " background:transparent; border:none;")
+                                      .arg(colors::TEXT_TERTIARY())
+                                      .arg(fonts::TINY)
+                                      .arg(fonts::DATA_FAMILY()));
+    deploy_hl->addWidget(deploy_status_, 1);
+
+    top_vl->addLayout(deploy_hl);
 
     root->addWidget(top_bar);
 
@@ -150,15 +234,6 @@ void StrategyListPanel::build_ui() {
     page_hl->setContentsMargins(12, 0, 12, 0);
     page_hl->setSpacing(8);
 
-    const QString btn_style =
-        QString("QPushButton { background:%1; color:%2; border:1px solid %3;"
-                " font-size:%4px; font-family:%5; padding:2px 12px; }"
-                "QPushButton:hover { border-color:%6; color:%6; }"
-                "QPushButton:disabled { color:%3; border-color:%3; }")
-            .arg(colors::BG_SURFACE(), colors::TEXT_PRIMARY(), colors::BORDER_DIM())
-            .arg(fonts::TINY)
-            .arg(fonts::DATA_FAMILY(), colors::CYAN());
-
     prev_btn_ = new QPushButton("◀ PREV", page_bar);
     prev_btn_->setFixedHeight(24);
     prev_btn_->setCursor(Qt::PointingHandCursor);
@@ -190,6 +265,32 @@ void StrategyListPanel::build_ui() {
             this, &StrategyListPanel::on_sort_changed);
     connect(prev_btn_, &QPushButton::clicked, this, [this]() { go_to_page(current_page_ - 1); });
     connect(next_btn_, &QPushButton::clicked, this, [this]() { go_to_page(current_page_ + 1); });
+    connect(deploy_mode_, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+            [this](int) { refresh_account_combo(); });
+    connect(deploy_btn_, &QPushButton::clicked, this, &StrategyListPanel::deploy_selected_strategy);
+    refresh_account_combo();
+}
+
+void StrategyListPanel::refresh_account_combo() {
+    if (!deploy_account_ || !deploy_mode_)
+        return;
+
+    deploy_account_->clear();
+    const bool live_mode = deploy_mode_->currentText() == "live";
+    deploy_account_->setEnabled(live_mode);
+    if (!live_mode) {
+        deploy_account_->addItem("Paper simulation", {});
+        return;
+    }
+
+    for (const auto& account : fincept::trading::AccountManager::instance().active_accounts()) {
+        if (account.trading_mode != "live")
+            continue;
+        deploy_account_->addItem(QString("%1 · %2").arg(account.display_name, account.broker_id),
+                                 account.account_id);
+    }
+    if (deploy_account_->count() == 0)
+        deploy_account_->addItem("No active live account", {});
 }
 
 // ── Render page ──────────────────────────────────────────────────────────────
@@ -332,6 +433,41 @@ void StrategyListPanel::on_strategies_loaded(QVector<AlgoStrategy> strategies) {
 
 void StrategyListPanel::on_error(const QString& context, const QString& msg) {
     LOG_ERROR("AlgoTrading", QString("StrategyList error [%1]: %2").arg(context, msg));
+    if (deploy_status_)
+        deploy_status_->setText(QString("Error [%1]: %2").arg(context, msg));
+}
+
+void StrategyListPanel::deploy_selected_strategy() {
+    const int row = table_ ? table_->currentRow() : -1;
+    if (row < 0 || !table_->item(row, 3)) {
+        deploy_status_->setText("Select a strategy row first.");
+        return;
+    }
+
+    const QString strategy_id = table_->item(row, 3)->text().trimmed();
+    const QString symbol = deploy_symbol_->text().trimmed();
+    if (symbol.isEmpty()) {
+        deploy_status_->setText("Enter a symbol.");
+        return;
+    }
+
+    bool qty_ok = false;
+    const double quantity = deploy_qty_->text().trimmed().toDouble(&qty_ok);
+    if (!qty_ok || quantity <= 0.0) {
+        deploy_status_->setText("Quantity must be greater than zero.");
+        return;
+    }
+
+    const QString mode = deploy_mode_->currentText();
+    const QString account_id = mode == "live" ? deploy_account_->currentData().toString() : QString();
+    if (mode == "live" && account_id.isEmpty()) {
+        deploy_status_->setText("Live bot requires an active live account.");
+        return;
+    }
+
+    deploy_status_->setText(QString("Starting %1 bot...").arg(mode));
+    AlgoTradingService::instance().deploy_strategy(strategy_id, symbol, mode, deploy_tf_->currentText(),
+                                                   quantity, account_id);
 }
 
 } // namespace fincept::screens

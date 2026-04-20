@@ -603,6 +603,32 @@ class QlibService:
             "available_count": len(HANDLERS_AVAILABLE)
         }
 
+    def get_factor_library(self) -> Dict[str, Any]:
+        """Return a UI-friendly flattened factor catalogue."""
+        handlers_result = self.get_data_handlers()
+        handlers = handlers_result.get("handlers", {})
+        factors = []
+
+        for handler_name, meta in handlers.items():
+            category = meta.get("category", "technical")
+            for factor_name in meta.get("factors", []):
+                factors.append({
+                    "name": str(factor_name),
+                    "category": category,
+                    "handler": handler_name,
+                    "expression": f"{handler_name}:{factor_name}",
+                    "available": bool(meta.get("available", False)),
+                    "description": meta.get("description", ""),
+                })
+
+        return {
+            "success": True,
+            "factors": factors,
+            "count": len(factors),
+            "handlers": handlers,
+            "available_count": handlers_result.get("available_count", 0),
+        }
+
     def get_strategies(self) -> Dict[str, Any]:
         """Get available trading strategies"""
         strategies = {
@@ -1328,6 +1354,9 @@ def main():
 
         elif command == "get_data_handlers":
             result = service.get_data_handlers()
+
+        elif command == "get_factor_library":
+            result = service.get_factor_library()
 
         elif command == "get_strategies":
             result = service.get_strategies()

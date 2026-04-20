@@ -40,6 +40,7 @@ if quant_dir not in sys.path:
     sys.path.insert(0, quant_dir)
 
 import json
+import re
 import numpy as np
 import pandas as pd
 from typing import Dict, Any, List, Optional, Union
@@ -163,19 +164,64 @@ class CFAQuantEngine:
 
     def _parse_data(self, data: Union[str, List, Dict]) -> np.ndarray:
         if isinstance(data, str):
+            text = data.strip()
+            if not text:
+                return np.array([], dtype=float)
+
             try:
-                parsed = json.loads(data)
+                parsed = json.loads(text)
                 if isinstance(parsed, list):
                     return np.array(parsed, dtype=float)
                 return np.array(parsed, dtype=float)
             except json.JSONDecodeError:
-                values = [float(x.strip()) for x in data.split(',') if x.strip()]
-                return np.array(values)
+                pass
+
+            try:
+                values = [float(x.strip()) for x in text.split(',') if x.strip()]
+                if values:
+                    return np.array(values, dtype=float)
+            except ValueError:
+                pass
+
+            if re.fullmatch(r"[\^A-Za-z0-9._=\-]{1,32}", text):
+                return self._load_symbol_close_prices(text)
+
+            raise ValueError("Data must be a numeric list, JSON array, or a valid ticker symbol")
         elif isinstance(data, list):
             return np.array(data, dtype=float)
         elif isinstance(data, dict):
             return pd.DataFrame(data).values
         return np.array(data, dtype=float)
+
+    def _load_symbol_close_prices(self, symbol: str) -> np.ndarray:
+        try:
+            import io
+            import contextlib
+            import yfinance as yf
+        except Exception as e:
+            raise ValueError(f"Ticker data requires yfinance: {e}") from e
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            hist = yf.download(
+                symbol.upper(),
+                period="1y",
+                interval="1d",
+                progress=False,
+                auto_adjust=True,
+                threads=True,
+            )
+
+        if hist is None or hist.empty:
+            raise ValueError(f"No market data found for ticker: {symbol}")
+
+        close = hist["Close"]
+        if isinstance(close, pd.DataFrame):
+            close = close.iloc[:, 0]
+        close = close.dropna()
+        if len(close) < 10:
+            raise ValueError(f"Insufficient data for {symbol}: need at least 10 observations, got {len(close)}")
+        return close.astype(float).to_numpy()
 
     def list_analyses(self) -> Dict[str, Any]:
         return {

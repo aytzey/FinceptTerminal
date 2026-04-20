@@ -297,7 +297,8 @@ void AIQuantLabScreen::refresh_theme() {
         brand->setStyleSheet(QString("color:%1; font-weight:700; font-size:%2px;"
                                      "padding:3px 10px; background:rgba(157,78,221,0.10);"
                                      "border:1px solid rgba(157,78,221,0.28); border-radius:2px;")
-                                 .arg(INFO(), TINY));
+                                 .arg(INFO())
+                                 .arg(TINY));
 
     if (auto* div = top_bar_->findChild<QWidget*>("aqTopDiv"))
         div->setStyleSheet(QString("background:%1;").arg(BORDER_DIM()));
@@ -312,7 +313,8 @@ void AIQuantLabScreen::refresh_theme() {
         lbl->setStyleSheet(QString("color:%1; font-size:%2px; font-weight:700;"
                                    "padding:3px 8px; background:rgba(22,163,74,0.08);"
                                    "border:1px solid rgba(22,163,74,0.25); border-radius:2px;")
-                               .arg(POSITIVE(), TINY));
+                               .arg(POSITIVE())
+                               .arg(TINY));
 
     // Left sidebar
     left_panel_->setStyleSheet(QString("background:%1; border-right:1px solid %2;").arg(BG_SURFACE(), BORDER_DIM()));
@@ -321,24 +323,25 @@ void AIQuantLabScreen::refresh_theme() {
         hdr->setStyleSheet(QString("background:%1; border-bottom:1px solid %2;").arg(BG_SURFACE(), BORDER_DIM()));
 
     sidebar_title_->setStyleSheet(
-        QString("color:%1; font-weight:700; font-size:%2px; letter-spacing:1px;").arg(CYAN(), TINY));
+        QString("color:%1; font-weight:700; font-size:%2px;").arg(CYAN()).arg(TINY));
 
     // Category labels
     for (auto* lbl : left_panel_->findChildren<QLabel*>("aqCatLabel"))
         lbl->setStyleSheet(QString("color:%1; font-weight:700; font-size:%2px;"
                                    "padding:8px 12px 4px 12px; letter-spacing:1px; background:transparent;")
-                               .arg(TEXT_TERTIARY(), TINY));
+                               .arg(TEXT_TERTIARY())
+                               .arg(TINY));
 
     // Right sidebar
     right_panel_->setStyleSheet(QString("background:%1; border-left:1px solid %2;").arg(BG_SURFACE(), BORDER_DIM()));
 
     if (auto* t = right_panel_->findChild<QLabel*>("aqInfoTitle"))
-        t->setStyleSheet(QString("color:%1; font-weight:700; font-size:%2px; letter-spacing:1px;").arg(CYAN(), TINY));
+        t->setStyleSheet(QString("color:%1; font-weight:700; font-size:%2px;").arg(CYAN()).arg(TINY));
 
     right_category_->setStyleSheet(
-        QString("color:%1; font-size:%2px; background:transparent;").arg(TEXT_SECONDARY(), TINY));
+        QString("color:%1; font-size:%2px; background:transparent;").arg(TEXT_SECONDARY()).arg(TINY));
 
-    right_desc_->setStyleSheet(QString("color:%1; font-size:%2px; background:transparent;").arg(TEXT_PRIMARY(), TINY));
+    right_desc_->setStyleSheet(QString("color:%1; font-size:%2px; background:transparent;").arg(TEXT_PRIMARY()).arg(TINY));
 
     right_script_->setStyleSheet(QString("color:%1; font-size:%2px; padding:6px;"
                                          "background:%3; border:1px solid %4; border-radius:2px;")
@@ -348,26 +351,26 @@ void AIQuantLabScreen::refresh_theme() {
         QString("background:%1; border:1px solid %2; border-radius:3px;").arg(BG_RAISED(), BORDER_DIM()));
 
     stats_title_->setStyleSheet(
-        QString("color:%1; font-weight:700; font-size:%2px; letter-spacing:0.5px;").arg(CYAN(), TINY));
+        QString("color:%1; font-weight:700; font-size:%2px;").arg(CYAN()).arg(TINY));
 
     for (auto* lbl : stats_card_->findChildren<QLabel*>("aqStatLabel"))
-        lbl->setStyleSheet(QString("color:%1; font-size:%2px; background:transparent;").arg(TEXT_TERTIARY(), TINY));
+        lbl->setStyleSheet(QString("color:%1; font-size:%2px; background:transparent;").arg(TEXT_TERTIARY()).arg(TINY));
 
     for (auto* val : stats_card_->findChildren<QLabel*>("aqStatValue"))
         val->setStyleSheet(
-            QString("color:%1; font-weight:700; font-size:%2px; background:transparent;").arg(TEXT_PRIMARY(), TINY));
+            QString("color:%1; font-weight:700; font-size:%2px; background:transparent;").arg(TEXT_PRIMARY()).arg(TINY));
 
     // Status bar
     status_bar_->setStyleSheet(QString("background:%1; border-top:1px solid %2;").arg(BG_RAISED(), BORDER_DIM()));
 
     for (auto* lbl : status_bar_->findChildren<QLabel*>("aqStatusLabel"))
-        lbl->setStyleSheet(QString("color:%1; font-size:%2px; background:transparent;").arg(TEXT_TERTIARY(), TINY));
+        lbl->setStyleSheet(QString("color:%1; font-size:%2px; background:transparent;").arg(TEXT_TERTIARY()).arg(TINY));
 
     status_engine_val_->setStyleSheet(
-        QString("color:%1; font-weight:700; font-size:%2px; background:transparent;").arg(POSITIVE(), TINY));
+        QString("color:%1; font-weight:700; font-size:%2px; background:transparent;").arg(POSITIVE()).arg(TINY));
 
     status_ready_lbl_->setStyleSheet(
-        QString("color:%1; font-weight:700; font-size:%2px; background:transparent;").arg(POSITIVE(), TINY));
+        QString("color:%1; font-weight:700; font-size:%2px; background:transparent;").arg(POSITIVE()).arg(TINY));
 
     // Re-apply selection styles so active module stays highlighted after theme switch
     update_sidebar_selection();

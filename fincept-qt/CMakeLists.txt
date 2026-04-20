@@ -457,6 +457,9 @@ set(STORAGE_SOURCES
     src/storage/sqlite/migrations/v018_widget_config.cpp
     src/storage/sqlite/migrations/v019_llm_reasoning_effort.cpp
     src/storage/sqlite/migrations/v020_codex_defaults.cpp
+    src/storage/sqlite/migrations/v021_algo_trading_runtime.cpp
+    src/storage/sqlite/migrations/v022_algo_order_reconciliation.cpp
+    src/storage/sqlite/migrations/v023_algo_order_apply_state.cpp
 )
 
 # Python runner
@@ -1269,6 +1272,9 @@ set_source_files_properties(
     src/storage/sqlite/migrations/v018_widget_config.cpp
     src/storage/sqlite/migrations/v019_llm_reasoning_effort.cpp
     src/storage/sqlite/migrations/v020_codex_defaults.cpp
+    src/storage/sqlite/migrations/v021_algo_trading_runtime.cpp
+    src/storage/sqlite/migrations/v022_algo_order_reconciliation.cpp
+    src/storage/sqlite/migrations/v023_algo_order_apply_state.cpp
     # Polymarket screen files — each defines static fmt_* helpers in same namespace
     src/screens/polymarket/PolymarketScreen.cpp
     src/screens/polymarket/PolymarketCommandBar.cpp
@@ -1803,12 +1809,18 @@ if(WIN32)
 endif()
 
 # ── Copy Python scripts to build output ──────────────────────────────────────
-add_custom_command(TARGET FinceptTerminal POST_BUILD
+# Keep this as an ALL target, not only POST_BUILD. Python scripts are runtime
+# source files; if only a script changes, the C++ executable may be up-to-date
+# and a POST_BUILD command would not run, leaving build/scripts stale.
+add_custom_target(FinceptCopyPythonScripts ALL
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+        "$<TARGET_FILE_DIR:FinceptTerminal>/scripts"
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_CURRENT_SOURCE_DIR}/scripts"
         "$<TARGET_FILE_DIR:FinceptTerminal>/scripts"
     COMMENT "Copying Python scripts to build output..."
 )
+add_dependencies(FinceptTerminal FinceptCopyPythonScripts)
 
 # ── Copy requirements files to build output ──────────────────────────────────
 # PythonSetupManager::find_requirements_file() searches exe_dir/resources/ first.

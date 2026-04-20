@@ -14,11 +14,14 @@
 #    include "datahub/DataHubMetaTypes.h"
 
 #include <QCoreApplication>
+#include <QDateTime>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QMutexLocker>
 #include <QThread>
 #include <QtConcurrent/QtConcurrent>
+
+#include <algorithm>
 
 // Adapter: PythonRunner uses scripts_dir(), not resolve_script()
 namespace {
@@ -312,6 +315,12 @@ void ExchangeService::start_daemon() {
     if (daemon_process_ && daemon_process_->state() == QProcess::Running)
         return;
 
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (daemon_retry_after_ms_ > now) {
+        LOG_DEBUG(TAG, QString("Daemon restart suppressed for %1ms").arg(daemon_retry_after_ms_ - now));
+        return;
+    }
+
     QString python_path = python::PythonRunner::instance().python_path();
     QString script_path = resolve_script_path("exchange/exchange_daemon.py");
 
@@ -321,7 +330,10 @@ void ExchangeService::start_daemon() {
     }
 
     daemon_process_ = new QProcess(this);
+    daemon_stopping_ = false;
     daemon_process_->setProcessChannelMode(QProcess::SeparateChannels);
+    daemon_process_->setProcessEnvironment(python::PythonRunner::instance().build_python_env());
+    daemon_process_->setWorkingDirectory(python::PythonRunner::instance().scripts_dir());
 
     connect(daemon_process_, &QProcess::readyReadStandardOutput, this, &ExchangeService::drain_daemon_buffer);
     connect(daemon_process_, &QProcess::readyReadStandardError, this, [this]() {
@@ -333,15 +345,34 @@ void ExchangeService::start_daemon() {
     });
     connect(daemon_process_, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
             [this](int code, QProcess::ExitStatus status) {
-                LOG_WARN(
-                    TAG,
-                    QString("Daemon exited (code=%1, status=%2), will restart on next call").arg(code).arg(status));
+                if (!daemon_stopping_) {
+                    daemon_failure_count_ = std::min(daemon_failure_count_ + 1, 6);
+                    const int delay_ms = std::min(30000, 2000 * (1 << std::min(daemon_failure_count_ - 1, 4)));
+                    daemon_retry_after_ms_ = QDateTime::currentMSecsSinceEpoch() + delay_ms;
+                    LOG_WARN(TAG,
+                             QString("Daemon exited (code=%1, status=%2), retry in %3ms")
+                                 .arg(code)
+                                 .arg(status)
+                                 .arg(delay_ms));
+                } else {
+                    LOG_DEBUG(TAG, QString("Daemon stopped (code=%1, status=%2)").arg(code).arg(status));
+                }
                 daemon_ready_ = false;
+                daemon_response_ready_.wakeAll();
                 if (daemon_process_) {
                     daemon_process_->deleteLater();
                     daemon_process_ = nullptr;
                 }
             });
+    connect(daemon_process_, &QProcess::errorOccurred, this, [this](QProcess::ProcessError) {
+        daemon_ready_ = false;
+        daemon_response_ready_.wakeAll();
+        daemon_failure_count_ = std::min(daemon_failure_count_ + 1, 6);
+        const int delay_ms = std::min(30000, 2000 * (1 << std::min(daemon_failure_count_ - 1, 4)));
+        daemon_retry_after_ms_ = QDateTime::currentMSecsSinceEpoch() + delay_ms;
+        if (daemon_process_)
+            LOG_WARN(TAG, "Daemon process error: " + daemon_process_->errorString());
+    });
 
     QStringList args;
     args << "-u" << "-B" << script_path;
@@ -352,6 +383,7 @@ void ExchangeService::start_daemon() {
 void ExchangeService::stop_daemon() {
     if (daemon_process_) {
         daemon_ready_ = false;
+        daemon_stopping_ = true;
         daemon_process_->closeWriteChannel();
         // Give it a moment to exit cleanly, then force kill
         auto* proc = daemon_process_;
@@ -372,6 +404,10 @@ bool ExchangeService::wait_for_daemon_ready(int timeout_ms) {
     // Fast path — already up.
     if (daemon_ready_.load())
         return true;
+
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (daemon_retry_after_ms_ > now)
+        return false;
 
     // Kick the daemon start if the process hasn't been spawned yet. start_daemon
     // must run on the main thread because it owns daemon_process_.
@@ -414,6 +450,8 @@ void ExchangeService::drain_daemon_buffer() {
         // Handle the init response
         if (id == "__init__") {
             daemon_ready_ = true;
+            daemon_failure_count_ = 0;
+            daemon_retry_after_ms_ = 0;
             LOG_INFO(TAG, "Exchange daemon ready (pid=" +
                               obj.value("data").toObject().value("pid").toVariant().toString() + ")");
             // Send credentials if we have them
@@ -902,6 +940,8 @@ QJsonObject ExchangeService::call_script(const QString& script, const QStringLis
     full_args.append(args);
 
     QProcess proc;
+    proc.setProcessEnvironment(python::PythonRunner::instance().build_python_env());
+    proc.setWorkingDirectory(python::PythonRunner::instance().scripts_dir());
     proc.start(python_path, full_args);
     const bool finished = proc.waitForFinished(30000);
     if (!finished) {
@@ -966,6 +1006,8 @@ QJsonObject ExchangeService::call_script_with_credentials(const QString& script,
     full_args.append(args);
 
     QProcess proc;
+    proc.setProcessEnvironment(python::PythonRunner::instance().build_python_env());
+    proc.setWorkingDirectory(python::PythonRunner::instance().scripts_dir());
     proc.start(python_path, full_args);
     proc.waitForStarted(5000);
 

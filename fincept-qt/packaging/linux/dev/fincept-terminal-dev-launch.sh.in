@@ -13,7 +13,7 @@ if [ ! -x "$BIN" ] || [ ! -f "$STAMP" ]; then
 else
     if [ "$APP_DIR/CMakeLists.txt" -nt "$STAMP" ] || [ "$APP_DIR/CMakePresets.json" -nt "$STAMP" ]; then
         needs_build=1
-    elif find "$APP_DIR/src" "$APP_DIR/resources" "$APP_DIR/tests" "$APP_DIR/cmake" -type f -newer "$STAMP" -print -quit | grep -q .; then
+    elif find "$APP_DIR/src" "$APP_DIR/resources" "$APP_DIR/tests" "$APP_DIR/cmake" "$APP_DIR/scripts" -type f -newer "$STAMP" -print -quit | grep -q .; then
         needs_build=1
     fi
 fi

@@ -150,6 +150,7 @@ class MarketDataService : public QObject
     };
     QVector<PendingRequest> pending_;
     bool batch_scheduled_ = false;
+    bool quote_fetch_in_progress_ = false;
 
     bool hub_registered_ = false;
 

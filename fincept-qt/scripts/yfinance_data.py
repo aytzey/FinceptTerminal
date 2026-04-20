@@ -6,6 +6,7 @@ Returns JSON output for Qt/C++ integration
 
 import sys
 import json
+import math
 try:
     import yfinance as yf
 except Exception:
@@ -13,36 +14,217 @@ except Exception:
 import pandas as pd
 from datetime import datetime
 
+QUOTE_BATCH_CHUNK_SIZE = 96
+QUOTE_FALLBACK_LIMIT = 12
+
+def _unique_symbols(symbols):
+    """Normalize and de-duplicate symbols while preserving UI/request order."""
+    result = []
+    seen = set()
+    for symbol in symbols:
+        normalized = (symbol or "").strip().upper()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    return result
+
+def _chunks(items, size):
+    for idx in range(0, len(items), size):
+        yield items[idx:idx + size]
+
+def _safe_float(value):
+    try:
+        value = float(value)
+        if math.isfinite(value):
+            return value
+    except Exception:
+        pass
+    return None
+
+def _safe_int(value):
+    value = _safe_float(value)
+    if value is None:
+        return 0
+    return int(value)
+
+def _round_price(value):
+    value = _safe_float(value)
+    if value is None:
+        return None
+    if abs(value) < 1:
+        return round(value, 8)
+    if abs(value) < 100:
+        return round(value, 4)
+    return round(value, 2)
+
+def _last_valid_value(hist, column):
+    if hist is None or column not in hist:
+        return None
+    series = hist[column].dropna()
+    if series.empty:
+        return None
+    return _safe_float(series.iloc[-1])
+
+def _last_valid_timestamp(hist):
+    if hist is None or hist.empty:
+        return int(datetime.now().timestamp())
+    clean = hist.dropna(how='all')
+    if clean.empty:
+        return int(datetime.now().timestamp())
+    try:
+        return int(clean.index[-1].timestamp())
+    except Exception:
+        return int(datetime.now().timestamp())
+
+def _symbol_frame(data, symbol):
+    if data is None or data.empty:
+        return None
+    if not isinstance(data.columns, pd.MultiIndex):
+        return data
+
+    level0 = data.columns.get_level_values(0).unique().tolist()
+    level1 = data.columns.get_level_values(1).unique().tolist()
+    if symbol in level0:
+        return data[symbol]
+    if symbol in level1:
+        return data.xs(symbol, axis=1, level=1)
+    return None
+
+def _download(symbols, period, interval):
+    if yf is None:
+        return None
+
+    import io, contextlib
+
+    # yfinance writes progress and some transport diagnostics to stdout; keep
+    # stdout clean because the Qt host parses the last JSON line.
+    _buf = io.StringIO()
+    with contextlib.redirect_stdout(_buf), contextlib.redirect_stderr(_buf):
+        return yf.download(
+            symbols if len(symbols) > 1 else symbols[0],
+            period=period,
+            interval=interval,
+            group_by='ticker',
+            progress=False,
+            threads=True,
+            auto_adjust=False,
+            actions=False,
+        )
+
+def _quote_from_frames(symbol, daily_hist, intraday_hist):
+    daily = None if daily_hist is None else daily_hist.dropna(how='all')
+    intraday = None if intraday_hist is None else intraday_hist.dropna(how='all')
+
+    current_price = _last_valid_value(intraday, 'Close')
+    current_source = intraday
+    if current_price is None or current_price <= 0:
+        current_price = _last_valid_value(daily, 'Close')
+        current_source = daily
+
+    if current_price is None or current_price <= 0:
+        return None
+
+    daily_close = [] if daily is None or 'Close' not in daily else [
+        _safe_float(v) for v in daily['Close'].dropna().tolist()
+    ]
+    daily_close = [v for v in daily_close if v is not None and v > 0]
+
+    if len(daily_close) >= 2:
+        previous_close = daily_close[-2]
+    elif len(daily_close) == 1:
+        previous_close = daily_close[0]
+    else:
+        previous_close = current_price
+
+    change = current_price - previous_close
+    change_percent = (change / previous_close) * 100 if previous_close else 0
+
+    high = _last_valid_value(daily, 'High')
+    low = _last_valid_value(daily, 'Low')
+    open_price = _last_valid_value(daily, 'Open')
+    volume = _last_valid_value(daily, 'Volume')
+
+    # During market hours the daily candle can lag on some Yahoo endpoints.
+    # Prefer intraday session extrema when available for fresher on-screen data.
+    if intraday is not None and not intraday.empty:
+        if 'High' in intraday:
+            high_series = intraday['High'].dropna()
+            if not high_series.empty:
+                high = _safe_float(high_series.max())
+        if 'Low' in intraday:
+            low_series = intraday['Low'].dropna()
+            if not low_series.empty:
+                low = _safe_float(low_series.min())
+        if 'Open' in intraday:
+            open_series = intraday['Open'].dropna()
+            if not open_series.empty:
+                open_price = _safe_float(open_series.iloc[0])
+        if 'Volume' in intraday:
+            volume_series = intraday['Volume'].dropna()
+            if not volume_series.empty:
+                volume = _safe_float(volume_series.sum())
+
+    return {
+        "symbol": symbol,
+        "name": symbol,
+        "price": _round_price(current_price),
+        "change": _round_price(change),
+        "change_percent": round(float(change_percent), 2),
+        "volume": _safe_int(volume),
+        "high": _round_price(high),
+        "low": _round_price(low),
+        "open": _round_price(open_price),
+        "previous_close": _round_price(previous_close),
+        "timestamp": _last_valid_timestamp(current_source),
+        "exchange": "",
+        "source": "yfinance_batch_intraday" if current_source is intraday else "yfinance_batch_daily",
+    }
+
 def get_quote(symbol):
     """Fetch real-time quote for a single symbol"""
     try:
+        if yf is None:
+            return {"error": "yfinance unavailable", "symbol": symbol}
+
+        symbol = (symbol or "").strip().upper()
+        if not symbol:
+            return {"error": "Empty symbol", "symbol": symbol}
+
         import io, contextlib
         ticker = yf.Ticker(symbol)
         _buf = io.StringIO()
-        with contextlib.redirect_stdout(_buf):
+        with contextlib.redirect_stdout(_buf), contextlib.redirect_stderr(_buf):
             info = ticker.info
-            hist = ticker.history(period="1d")
+            hist = ticker.history(period="5d", interval="1d", auto_adjust=False)
+            intraday = ticker.history(period="1d", interval="5m", auto_adjust=False)
 
         if hist.empty:
             return {"error": "No data available", "symbol": symbol}
 
-        current_price = hist['Close'].iloc[-1]
+        current_price = _last_valid_value(intraday, 'Close') or _last_valid_value(hist, 'Close')
+        if current_price is None or current_price <= 0:
+            return {"error": "No valid price", "symbol": symbol}
+
         previous_close = info.get('previousClose', current_price)
+        previous_close = _safe_float(previous_close) or current_price
         change = current_price - previous_close
         change_percent = (change / previous_close) * 100 if previous_close else 0
 
         quote_data = {
             "symbol": symbol,
-            "price": round(float(current_price), 2),
-            "change": round(float(change), 2),
+            "name": info.get('longName', info.get('shortName', symbol)),
+            "price": _round_price(current_price),
+            "change": _round_price(change),
             "change_percent": round(float(change_percent), 2),
-            "volume": int(hist['Volume'].iloc[-1]) if not hist['Volume'].empty else None,
-            "high": round(float(hist['High'].iloc[-1]), 2) if not hist['High'].empty else None,
-            "low": round(float(hist['Low'].iloc[-1]), 2) if not hist['Low'].empty else None,
-            "open": round(float(hist['Open'].iloc[-1]), 2) if not hist['Open'].empty else None,
-            "previous_close": round(float(previous_close), 2),
-            "timestamp": int(datetime.now().timestamp()),
-            "exchange": info.get('exchange', '')
+            "volume": _safe_int(_last_valid_value(hist, 'Volume')),
+            "high": _round_price(_last_valid_value(hist, 'High')),
+            "low": _round_price(_last_valid_value(hist, 'Low')),
+            "open": _round_price(_last_valid_value(hist, 'Open')),
+            "previous_close": _round_price(previous_close),
+            "timestamp": _last_valid_timestamp(intraday if intraday is not None and not intraday.empty else hist),
+            "exchange": info.get('exchange', ''),
+            "source": "yfinance_single"
         }
 
         return quote_data
@@ -246,75 +428,54 @@ def get_financials(symbol):
 
 def get_batch_quotes(symbols):
     """Fetch quotes for multiple symbols at once using yfinance batch download"""
+    symbols = _unique_symbols(symbols)
+    if not symbols:
+        return []
+    if yf is None:
+        return []
+
     try:
-        import io, contextlib
-        # Suppress any stdout noise from yfinance (progress bars, deprecation notices)
-        # that would corrupt the JSON output parsed by the host
-        _buf = io.StringIO()
-        with contextlib.redirect_stdout(_buf):
-            # Use 5d period to guarantee at least 2 trading days for futures/commodities
-            data = yf.download(symbols, period="5d", group_by='ticker', progress=False, threads=True, auto_adjust=True)
-
-        if data is None or data.empty:
-            return []
-
         results = []
-        for symbol in symbols:
-            try:
-                if not isinstance(data.columns, pd.MultiIndex):
-                    # Flat columns (rare): use directly
-                    hist = data
-                else:
-                    # MultiIndex columns — detect (Ticker, Price) vs (Price, Ticker)
-                    level0 = data.columns.get_level_values(0).unique().tolist()
-                    level1 = data.columns.get_level_values(1).unique().tolist()
-                    if symbol in level0:
-                        # (Ticker, Price) ordering
-                        hist = data[symbol]
-                    elif symbol in level1:
-                        # (Price, Ticker) ordering
-                        hist = data.xs(symbol, axis=1, level=1)
-                    else:
+        seen_results = set()
+
+        for chunk in _chunks(symbols, QUOTE_BATCH_CHUNK_SIZE):
+            # One daily batch supplies previous-close accuracy; one intraday
+            # batch supplies the freshest displayed price without falling back
+            # to N one-by-one .info calls.
+            daily_data = _download(chunk, period="5d", interval="1d")
+            intraday_data = _download(chunk, period="1d", interval="5m")
+
+            for symbol in chunk:
+                try:
+                    daily_hist = _symbol_frame(daily_data, symbol)
+                    intraday_hist = _symbol_frame(intraday_data, symbol)
+                    quote = _quote_from_frames(symbol, daily_hist, intraday_hist)
+                    if quote is None:
                         continue
-
-                if hist.empty or hist.dropna(how='all').empty:
+                    results.append(quote)
+                    seen_results.add(symbol)
+                except Exception:
                     continue
 
-                hist = hist.dropna(how='all')
-                raw_price = hist['Close'].iloc[-1]
-                if pd.isna(raw_price):
-                    continue
-                current_price = float(raw_price)
-                # Use previous trading day close for accurate daily change.
-                # With period="5d" we always have >= 2 rows for normally-traded instruments.
-                raw_prev = hist['Close'].iloc[-2] if len(hist) >= 2 else raw_price
-                previous_close = float(raw_prev) if not pd.isna(raw_prev) else current_price
-                change = current_price - previous_close
-                change_percent = (change / previous_close) * 100 if previous_close else 0
-
-                results.append({
-                    "symbol": symbol,
-                    "price": round(current_price, 2),
-                    "change": round(change, 2),
-                    "change_percent": round(change_percent, 2),
-                    "volume": int(hist['Volume'].iloc[-1]) if not pd.isna(hist['Volume'].iloc[-1]) else 0,
-                    "high": round(float(hist['High'].iloc[-1]), 2) if not pd.isna(hist['High'].iloc[-1]) else None,
-                    "low": round(float(hist['Low'].iloc[-1]), 2) if not pd.isna(hist['Low'].iloc[-1]) else None,
-                    "open": round(float(hist['Open'].iloc[-1]), 2) if not pd.isna(hist['Open'].iloc[-1]) else None,
-                    "previous_close": round(previous_close, 2),
-                    "timestamp": int(datetime.now().timestamp()),
-                    "exchange": ""
-                })
-            except Exception:
-                continue
+        # Targeted fallback for symbols that Yahoo omits from a multi-symbol
+        # download. Keep this bounded so one bad batch never rebuilds the old
+        # slow path of hundreds of sequential requests.
+        missing = [symbol for symbol in symbols if symbol not in seen_results]
+        for symbol in missing[:QUOTE_FALLBACK_LIMIT]:
+            quote = get_quote(symbol)
+            if quote and "error" not in quote:
+                quote["source"] = "yfinance_single_fallback"
+                results.append(quote)
 
         return results
     except Exception as e:
-        # Fallback: fetch one by one
+        # Bounded fallback: preserve partial service without flooding PythonRunner
+        # or Yahoo with one process worth of sequential ticker.info calls.
         results = []
-        for symbol in symbols:
+        for symbol in symbols[:QUOTE_FALLBACK_LIMIT]:
             quote = get_quote(symbol)
             if quote and "error" not in quote:
+                quote["source"] = "yfinance_single_fallback"
                 results.append(quote)
         return results
 

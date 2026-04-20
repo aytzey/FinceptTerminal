@@ -19,7 +19,7 @@ class AlgoTradingService : public QObject {
 
     // ── Deployment lifecycle ────────────────────────────────────────────────
     void deploy_strategy(const QString& strategy_id, const QString& symbol, const QString& mode,
-                         const QString& timeframe, double quantity);
+                         const QString& timeframe, double quantity, const QString& account_id = {});
     void stop_deployment(const QString& deployment_id);
     void stop_all_deployments();
     void list_deployments();

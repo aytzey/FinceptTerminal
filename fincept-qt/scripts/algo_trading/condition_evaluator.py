@@ -56,7 +56,7 @@ def load_candles_from_db(db_path: str, symbol: str, timeframe: str, limit: int =
         SELECT open_time, o, h, l, c, volume
         FROM candle_cache
         WHERE symbol = ? AND timeframe = ? AND is_closed = 1
-        ORDER BY open_time ASC
+        ORDER BY open_time DESC
         LIMIT ?
     """
     df = pd.read_sql_query(query, conn, params=(symbol, timeframe, limit))
@@ -88,6 +88,8 @@ def load_candles_from_db(db_path: str, symbol: str, timeframe: str, limit: int =
         log.warning(f"  NO candle data found for '{symbol}' @ {timeframe}")
         return pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
 
+    df.sort_values('open_time', inplace=True)
+    df.reset_index(drop=True, inplace=True)
     df.rename(columns={'o': 'open', 'h': 'high', 'l': 'low', 'c': 'close'}, inplace=True)
     return df
 

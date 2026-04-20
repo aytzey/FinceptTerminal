@@ -97,39 +97,43 @@ namespace fincept::screens {
 using namespace fincept::ui;
 #include "ui/theme/ThemeManager.h"
 
+static bool is_local_quantlib_endpoint(const QString& endpoint);
+static QStringList available_quantlib_endpoints(const QString& module_id);
+static int local_quantlib_endpoint_count(const QString& module_id);
+
 // ── Module definitions ──────────────────────────────────────────────────────
 
 static QList<QuantModule> build_modules() {
     return {
         {"core",
          "Core",
-         51,
+         local_quantlib_endpoint_count("core"),
          {"Types", "Conventions", "AutoDiff", "Distributions", "Math", "Operations", "Legs", "Periods"}},
         {"analysis",
          "Analysis",
-         122,
+         local_quantlib_endpoint_count("analysis"),
          {"Fundamentals", "Profitability", "Liquidity", "Efficiency", "Growth", "Leverage", "Valuation Ratios",
           "DCF Valuation"}},
-        {"curves", "Curves", 31, {"Build & Query", "Transforms", "NS/NSS Fitting", "Specialized"}},
-        {"economics", "Economics", 25, {"Equilibrium", "Game Theory", "Auctions", "Utility Theory"}},
-        {"instruments", "Instruments", 26, {"Bonds", "Swaps/FRA", "Markets", "Credit/Futures"}},
+        {"curves", "Curves", local_quantlib_endpoint_count("curves"), {"Build & Query", "Transforms", "NS/NSS Fitting", "Specialized"}},
+        {"economics", "Economics", local_quantlib_endpoint_count("economics"), {"Equilibrium", "Game Theory", "Auctions", "Utility Theory"}},
+        {"instruments", "Instruments", local_quantlib_endpoint_count("instruments"), {"Bonds", "Swaps/FRA", "Markets", "Credit/Futures"}},
         {"ml",
          "Machine Learning",
-         48,
+         local_quantlib_endpoint_count("ml"),
          {"Credit", "Regression", "Clustering", "Preprocessing", "Features", "Validation", "Time Series",
           "GP/Neural Net", "Factor/Covariance"}},
-        {"models", "Models", 14, {"Short Rate", "Hull-White", "Heston", "Jump Diffusion", "Dupire/SVI"}},
-        {"numerical", "Numerical", 28, {"Diff/FFT/Int", "Interp/LinAlg", "ODE/Roots/Opt"}},
-        {"physics", "Physics", 24, {"Entropy", "Thermodynamics"}},
-        {"portfolio", "Portfolio", 15, {"Optimization", "Risk Metrics"}},
-        {"pricing", "Pricing", 29, {"Black-Scholes", "Black76", "Bachelier", "Numerical"}},
-        {"regulatory", "Regulatory", 11, {"Basel III", "SA-CCR", "IFRS 9", "Liquidity", "Stress Test"}},
-        {"risk", "Risk", 25, {"VaR/Stress", "EVT/XVA", "Sensitivities"}},
-        {"scheduling", "Scheduling", 14, {"Calendars", "Day Count"}},
-        {"solver", "Solver", 25, {"Bond Analytics", "Rates/IV", "Cashflows"}},
-        {"statistics", "Statistics", 52, {"Continuous Dist", "Discrete Dist", "Time Series"}},
-        {"stochastic", "Stochastic", 36, {"Processes", "Exact", "Simulation", "Sampling", "Theory"}},
-        {"volatility", "Volatility", 14, {"Surface", "SABR", "Local Vol"}},
+        {"models", "Models", local_quantlib_endpoint_count("models"), {"Short Rate", "Hull-White", "Heston", "Jump Diffusion", "Dupire/SVI"}},
+        {"numerical", "Numerical", local_quantlib_endpoint_count("numerical"), {"Diff/FFT/Int", "Interp/LinAlg", "ODE/Roots/Opt"}},
+        {"physics", "Physics", local_quantlib_endpoint_count("physics"), {"Entropy", "Thermodynamics"}},
+        {"portfolio", "Portfolio", local_quantlib_endpoint_count("portfolio"), {"Optimization", "Risk Metrics"}},
+        {"pricing", "Pricing", local_quantlib_endpoint_count("pricing"), {"Black-Scholes", "Black76", "Bachelier", "Numerical"}},
+        {"regulatory", "Regulatory", local_quantlib_endpoint_count("regulatory"), {"Basel III", "SA-CCR", "IFRS 9", "Liquidity", "Stress Test"}},
+        {"risk", "Risk", local_quantlib_endpoint_count("risk"), {"VaR/Stress", "EVT/XVA", "Sensitivities"}},
+        {"scheduling", "Scheduling", local_quantlib_endpoint_count("scheduling"), {"Calendars", "Day Count"}},
+        {"solver", "Solver", local_quantlib_endpoint_count("solver"), {"Bond Analytics", "Rates/IV", "Cashflows"}},
+        {"statistics", "Statistics", local_quantlib_endpoint_count("statistics"), {"Continuous Dist", "Discrete Dist", "Time Series"}},
+        {"stochastic", "Stochastic", local_quantlib_endpoint_count("stochastic"), {"Processes", "Exact", "Simulation", "Sampling", "Theory"}},
+        {"volatility", "Volatility", local_quantlib_endpoint_count("volatility"), {"Surface", "SABR", "Local Vol"}},
     };
 }
 
@@ -1006,6 +1010,273 @@ static const QHash<QString, QStringList> MODULE_ENDPOINTS = {
       "analysis/industry/utilities"}},
 };
 
+static bool is_local_quantlib_endpoint(const QString& endpoint) {
+    static const QStringList exact = {
+        "analysis/fundamentals/comprehensive",
+        "analysis/fundamentals/liquidity",
+        "analysis/fundamentals/profitability",
+        "analysis/valuation/predictive/altman-z",
+        "analysis/valuation/predictive/piotroski-f",
+        "core/autodiff/dual-eval",
+        "core/autodiff/gradient",
+        "core/autodiff/taylor-expand",
+        "core/conventions/days-to-years",
+        "core/conventions/format-date",
+        "core/conventions/normalize-rate",
+        "core/conventions/normalize-volatility",
+        "core/conventions/parse-date",
+        "core/conventions/years-to-days",
+        "core/distributions/bivariate-normal/cdf",
+        "core/distributions/chi2/cdf",
+        "core/distributions/chi2/pdf",
+        "core/distributions/exponential/cdf",
+        "core/distributions/exponential/pdf",
+        "core/distributions/exponential/ppf",
+        "core/distributions/gamma/cdf",
+        "core/distributions/gamma/pdf",
+        "core/distributions/normal/cdf",
+        "core/distributions/normal/pdf",
+        "core/distributions/normal/ppf",
+        "core/distributions/t/cdf",
+        "core/distributions/t/pdf",
+        "core/distributions/t/ppf",
+        "core/legs/fixed",
+        "core/legs/float",
+        "core/legs/zero-coupon",
+        "core/math/eval",
+        "core/math/two-arg",
+        "core/ops/black-scholes",
+        "core/ops/black76",
+        "core/ops/cholesky",
+        "core/ops/covariance-matrix",
+        "core/ops/discount-cashflows",
+        "core/ops/forward-rate",
+        "core/ops/gbm-paths",
+        "core/ops/interpolate",
+        "core/ops/percentile",
+        "core/ops/statistics",
+        "core/ops/var",
+        "core/ops/zero-rate-convert",
+        "core/periods/day-count-fraction",
+        "core/periods/fixed-coupon",
+        "core/periods/float-coupon",
+        "core/types/currencies",
+        "core/types/frequencies",
+        "core/types/money/convert",
+        "core/types/money/create",
+        "core/types/notional-schedule",
+        "core/types/rate/convert",
+        "core/types/spread/from-bps",
+        "core/types/tenor/add-to-date",
+        "curves/build",
+        "curves/butterfly",
+        "curves/composite",
+        "curves/curve-points",
+        "curves/discount-factor",
+        "curves/forward-rate",
+        "curves/instantaneous-forward",
+        "curves/interpolate",
+        "curves/interpolate-derivative",
+        "curves/key-rate-shift",
+        "curves/monotonicity-check",
+        "curves/nelson-siegel/evaluate",
+        "curves/nss/evaluate",
+        "curves/parallel-shift",
+        "curves/proxy",
+        "curves/real-rate",
+        "curves/roll",
+        "curves/scale",
+        "curves/smoothness-penalty",
+        "curves/time-shift",
+        "curves/twist",
+        "curves/zero-rate",
+        "economics/equilibrium/cobb-douglas",
+        "economics/utility/cara",
+        "economics/utility/crra",
+        "economics/utility/log",
+        "economics/utility/quadratic",
+        "instruments/bond/fixed/analytics",
+        "instruments/bond/fixed/cashflows",
+        "instruments/bond/fixed/price",
+        "instruments/bond/fixed/yield",
+        "instruments/bond/zero-coupon/price",
+        "instruments/fx/forward",
+        "instruments/fx/garman-kohlhagen",
+        "instruments/money-market/deposit",
+        "instruments/money-market/repo",
+        "instruments/money-market/tbill",
+        "ml/covariance/estimate",
+        "numerical/differentiation/derivative",
+        "numerical/integration/quadrature",
+        "numerical/interpolation/evaluate",
+        "numerical/linalg/decompose",
+        "numerical/linalg/dot",
+        "numerical/linalg/matmul",
+        "numerical/linalg/matvec",
+        "numerical/linalg/norm",
+        "numerical/linalg/outer",
+        "numerical/linalg/transpose",
+        "numerical/roots/find-1d",
+        "numerical/roots/newton",
+        "physics/divergence/js",
+        "physics/divergence/kl",
+        "physics/entropy/renyi",
+        "physics/entropy/shannon",
+        "physics/entropy/tsallis",
+        "portfolio/optimize/efficient-frontier",
+        "portfolio/optimize/max-sharpe",
+        "portfolio/optimize/min-variance",
+        "portfolio/optimize/target-return",
+        "portfolio/risk-parity",
+        "portfolio/risk/comprehensive",
+        "portfolio/risk/contribution",
+        "portfolio/risk/cvar",
+        "portfolio/risk/incremental-var",
+        "portfolio/risk/inverse-volatility",
+        "portfolio/risk/portfolio-comprehensive",
+        "portfolio/risk/ratios",
+        "portfolio/risk/var",
+        "pricing/bachelier/greeks",
+        "pricing/bachelier/greeks-full",
+        "pricing/bachelier/implied-vol",
+        "pricing/bachelier/price",
+        "pricing/bachelier/shifted-lognormal",
+        "pricing/bachelier/vol-conversion",
+        "pricing/basket-levy",
+        "pricing/black76/caplet",
+        "pricing/black76/floorlet",
+        "pricing/black76/greeks",
+        "pricing/black76/greeks-full",
+        "pricing/black76/implied-vol",
+        "pricing/black76/price",
+        "pricing/black76/swaption",
+        "pricing/bs/asset-or-nothing-call",
+        "pricing/bs/asset-or-nothing-put",
+        "pricing/bs/digital-call",
+        "pricing/bs/digital-put",
+        "pricing/bs/greeks",
+        "pricing/bs/greeks-full",
+        "pricing/bs/implied-vol",
+        "pricing/bs/price",
+        "pricing/kirk/spread-greeks",
+        "pricing/kirk/spread-price",
+        "pricing/margrabe",
+        "regulatory/basel/capital-ratios",
+        "regulatory/ifrs9/ecl-12m",
+        "regulatory/ifrs9/ecl-lifetime",
+        "regulatory/ifrs9/sicr",
+        "regulatory/ifrs9/stage-assessment",
+        "regulatory/liquidity/lcr",
+        "regulatory/liquidity/nsfr",
+        "regulatory/saccr/ead",
+        "risk/backtest",
+        "risk/correlation-stress",
+        "risk/sensitivities/bucket-delta",
+        "risk/sensitivities/greeks",
+        "risk/sensitivities/key-rate-duration",
+        "risk/sensitivities/parallel-shift",
+        "risk/sensitivities/twist",
+        "risk/stress/scenario",
+        "risk/tail-risk/comprehensive",
+        "risk/var/component",
+        "risk/var/historical",
+        "risk/var/incremental",
+        "risk/var/marginal",
+        "risk/var/parametric",
+        "scheduling/adjustment/adjust-date",
+        "scheduling/adjustment/batch-adjust",
+        "scheduling/adjustment/methods",
+        "scheduling/calendar/add-business-days",
+        "scheduling/calendar/business-days-between",
+        "scheduling/calendar/is-business-day",
+        "scheduling/calendar/list",
+        "scheduling/calendar/next-business-day",
+        "scheduling/calendar/previous-business-day",
+        "scheduling/daycount/batch-year-fraction",
+        "scheduling/daycount/conventions",
+        "scheduling/daycount/day-count",
+        "scheduling/daycount/year-fraction",
+        "scheduling/schedule/generate",
+        "solver/finance/asw-spread",
+        "solver/finance/basis",
+        "solver/finance/bond-yield",
+        "solver/finance/convexity",
+        "solver/finance/discount-factor",
+        "solver/finance/duration",
+        "solver/finance/dv01",
+        "solver/finance/forward-rate",
+        "solver/finance/g-spread",
+        "solver/finance/i-spread",
+        "solver/finance/implied-vol",
+        "solver/finance/implied-vol-black76",
+        "solver/finance/irr",
+        "solver/finance/modified-duration",
+        "solver/finance/oas",
+        "solver/finance/par-rate",
+        "solver/finance/pv01",
+        "solver/finance/xirr",
+        "solver/finance/z-spread",
+        "solver/finance/zero-rate",
+        "statistics/distributions/beta/cdf",
+        "statistics/distributions/beta/pdf",
+        "statistics/distributions/binomial/cdf",
+        "statistics/distributions/binomial/pmf",
+        "statistics/distributions/binomial/properties",
+        "statistics/distributions/chi-squared/cdf",
+        "statistics/distributions/chi-squared/pdf",
+        "statistics/distributions/exponential/cdf",
+        "statistics/distributions/exponential/pdf",
+        "statistics/distributions/exponential/ppf",
+        "statistics/distributions/exponential/properties",
+        "statistics/distributions/gamma/cdf",
+        "statistics/distributions/gamma/pdf",
+        "statistics/distributions/gamma/properties",
+        "statistics/distributions/lognormal/cdf",
+        "statistics/distributions/lognormal/pdf",
+        "statistics/distributions/lognormal/ppf",
+        "statistics/distributions/lognormal/properties",
+        "statistics/distributions/normal/cdf",
+        "statistics/distributions/normal/pdf",
+        "statistics/distributions/normal/ppf",
+        "statistics/distributions/normal/properties",
+        "statistics/distributions/poisson/cdf",
+        "statistics/distributions/poisson/pmf",
+        "statistics/distributions/poisson/properties",
+        "statistics/distributions/student-t/cdf",
+        "statistics/distributions/student-t/pdf",
+        "stochastic/exact/gbm",
+        "stochastic/gbm/simulate",
+        "stochastic/sampling/antithetic",
+    };
+
+    if (exact.contains(endpoint))
+        return true;
+    if (endpoint.startsWith("analysis/ratios/"))
+        return true;
+    if (endpoint.startsWith("analysis/valuation/dcf/"))
+        return true;
+    if (endpoint.startsWith("pricing/binomial/"))
+        return true;
+    return false;
+}
+
+static QStringList available_quantlib_endpoints(const QString& module_id) {
+    const auto it = MODULE_ENDPOINTS.find(module_id);
+    if (it == MODULE_ENDPOINTS.end())
+        return {};
+
+    QStringList endpoints;
+    for (const auto& endpoint : it.value()) {
+        if (is_local_quantlib_endpoint(endpoint))
+            endpoints.append(endpoint);
+    }
+    return endpoints;
+}
+
+static int local_quantlib_endpoint_count(const QString& module_id) {
+    return available_quantlib_endpoints(module_id).size();
+}
+
 // ── Endpoint example bodies (verified against live API) ─────────────────────
 
 const QHash<QString, QString>& QuantLibScreen::endpoint_examples() {
@@ -1212,11 +1483,17 @@ void QuantLibScreen::populate_panels(int module_index) {
     endpoint_combo_->clear();
 
     const auto& m = modules_[module_index];
-    auto it = MODULE_ENDPOINTS.find(m.id);
-    if (it != MODULE_ENDPOINTS.end()) {
-        for (const auto& ep : it.value()) {
-            endpoint_combo_->addItem(ep);
-        }
+    const auto endpoints = available_quantlib_endpoints(m.id);
+    for (const auto& ep : endpoints) {
+        endpoint_combo_->addItem(ep);
+    }
+    if (endpoints.isEmpty()) {
+        endpoint_combo_->addItem("No local endpoint available for this module");
+        endpoint_combo_->setEnabled(false);
+        exec_btn_->setEnabled(false);
+    } else {
+        endpoint_combo_->setEnabled(true);
+        exec_btn_->setEnabled(!loading_);
     }
 
     connect(endpoint_combo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this,

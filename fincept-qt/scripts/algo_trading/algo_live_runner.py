@@ -20,8 +20,15 @@ import uuid
 import logging
 from datetime import datetime
 
+import pandas as pd
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from condition_evaluator import load_candles_from_db, evaluate_condition_group
+
+try:
+    import yfinance as yf
+except Exception:  # pragma: no cover - optional runtime dependency
+    yf = None
 
 # ── Heavy debug logging ──────────────────────────────────────────────
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'algo_runner_debug.log')
@@ -53,6 +60,7 @@ TIMEFRAME_SECONDS = {
 
 
 MAX_ORDER_VALUE_WARNING = 1_000_000  # Warn if order value exceeds this
+_YF_CACHE = {}
 
 
 def _db_execute_with_retry(conn, sql, params=(), retries=3, commit=True):
@@ -107,12 +115,24 @@ def update_deployment_status(conn, deploy_id: str, status: str, error: str = Non
     """Update deployment status in DB."""
     if error:
         _db_execute_with_retry(conn,
-            "UPDATE algo_deployments SET status = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (status, error, deploy_id))
+            "UPDATE algo_deployments SET status = ?, error_message = ?, pid = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (status, error, os.getpid(), deploy_id))
     else:
         _db_execute_with_retry(conn,
-            "UPDATE algo_deployments SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (status, deploy_id))
+            "UPDATE algo_deployments SET status = ?, pid = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (status, os.getpid(), deploy_id))
+
+
+def should_continue(conn, deploy_id: str) -> bool:
+    """Return False when the host requested this deployment to stop."""
+    try:
+        row = conn.execute("SELECT status FROM algo_deployments WHERE id = ?", (deploy_id,)).fetchone()
+        if not row:
+            return True
+        return str(row[0]).lower() not in {"stopping", "stopped", "cancelled", "canceled"}
+    except Exception as e:
+        log.warning(f"Could not read deployment stop status: {e}")
+        return True
 
 
 def update_metrics(conn, deploy_id: str, metrics: dict):
@@ -149,15 +169,145 @@ def record_trade(conn, deploy_id: str, symbol: str, side: str,
     return trade_id
 
 
-def create_order_signal(conn, deploy_id: str, symbol: str, side: str,
-                        quantity: float, order_type: str = 'MARKET', price: float = None):
+def create_order_signal(conn, deploy_id: str, account_id: str, symbol: str, side: str,
+                        quantity: float, order_type: str = 'MARKET', price: float = None,
+                        reason: str = ''):
     """Write an order signal for the host to execute (live mode)."""
     signal_id = f"signal-{uuid.uuid4()}"
     _db_execute_with_retry(conn,
-        "INSERT INTO algo_order_signals (id, deployment_id, symbol, side, quantity, order_type, price, status) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')",
-        (signal_id, deploy_id, symbol, side, quantity, order_type, price))
+        "INSERT INTO algo_order_signals "
+        "(id, deployment_id, account_id, symbol, side, quantity, order_type, price, status, signal_reason) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+        (signal_id, deploy_id, account_id or None, symbol, side, quantity, order_type, price, reason))
     return signal_id
+
+
+def load_runtime_state(conn, deploy_id: str):
+    """Resume in-memory state from the persisted metrics row after runner restarts."""
+    row = conn.execute(
+        """SELECT total_pnl, total_trades, win_rate, max_drawdown,
+                  current_position_qty, current_position_side, current_position_entry
+           FROM algo_metrics WHERE deployment_id = ?""",
+        (deploy_id,)
+    ).fetchone()
+    if not row:
+        return (
+            {'qty': 0, 'side': '', 'entry': 0, 'max_pnl_pct': 0},
+            0.0, 0, 0, 0.0, 0.0,
+        )
+
+    total_pnl = float(row[0] or 0)
+    total_trades = int(row[1] or 0)
+    win_rate = float(row[2] or 0)
+    winning_trades = int(round(total_trades * win_rate / 100.0)) if total_trades > 0 else 0
+    max_drawdown = float(row[3] or 0)
+    qty = float(row[4] or 0)
+    side = str(row[5] or '')
+    entry = float(row[6] or 0)
+    position = {
+        'qty': qty,
+        'side': side if qty else '',
+        'entry': entry if qty else 0,
+        'max_pnl_pct': 0,
+    }
+    return position, total_pnl, total_trades, winning_trades, max_drawdown, total_pnl
+
+
+def load_unapplied_order_signal(conn, deploy_id: str):
+    """Return the oldest live signal that the strategy has not applied to local state yet."""
+    try:
+        row = conn.execute(
+            """SELECT id, symbol, side, quantity, order_type, COALESCE(price, 0),
+                      status, COALESCE(order_id, ''), COALESCE(broker_status, ''),
+                      COALESCE(filled_qty, 0), COALESCE(avg_price, 0),
+                      COALESCE(error, ''), COALESCE(signal_reason, '')
+               FROM algo_order_signals
+               WHERE deployment_id = ?
+                 AND COALESCE(applied_at, '') = ''
+                 AND status IN ('pending', 'processing', 'submitted', 'filled', 'failed')
+               ORDER BY created_at ASC
+               LIMIT 1""",
+            (deploy_id,)
+        ).fetchone()
+    except sqlite3.OperationalError as e:
+        if 'no such column' in str(e).lower() or 'no such table' in str(e).lower():
+            return None
+        raise
+
+    if not row:
+        return None
+    keys = [
+        'id', 'symbol', 'side', 'quantity', 'order_type', 'price', 'status',
+        'order_id', 'broker_status', 'filled_qty', 'avg_price', 'error', 'reason',
+    ]
+    return dict(zip(keys, row))
+
+
+def mark_signal_applied(conn, signal_id: str):
+    _db_execute_with_retry(
+        conn,
+        "UPDATE algo_order_signals SET applied_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (signal_id,)
+    )
+
+
+def infer_signal_action(signal: dict, position: dict) -> str:
+    reason = str(signal.get('reason') or '').lower()
+    if 'entry' in reason:
+        return 'entry'
+    if 'exit' in reason or 'stop_loss' in reason or 'take_profit' in reason or 'trailing_stop' in reason:
+        return 'exit'
+    return 'entry' if not position or float(position.get('qty') or 0) == 0 else 'exit'
+
+
+def apply_live_order_signal(conn, deploy_id: str, signal: dict, position: dict,
+                            total_pnl: float, total_trades: int, winning_trades: int):
+    """Apply a reconciled live fill to strategy state. Returns state plus wait flag."""
+    status = str(signal.get('status') or '').lower()
+    signal_id = signal.get('id')
+
+    if status in {'pending', 'processing', 'submitted'}:
+        log.info(
+            f"  Waiting for live order {signal_id}: status={status} "
+            f"order_id={signal.get('order_id') or '-'} broker_status={signal.get('broker_status') or '-'}"
+        )
+        return position, total_pnl, total_trades, winning_trades, True
+
+    if status == 'failed':
+        log.error(f"  Live order {signal_id} failed: {signal.get('error') or signal.get('broker_status') or 'unknown error'}")
+        mark_signal_applied(conn, signal_id)
+        return position, total_pnl, total_trades, winning_trades, False
+
+    if status != 'filled':
+        return position, total_pnl, total_trades, winning_trades, False
+
+    qty = float(signal.get('filled_qty') or signal.get('quantity') or 0)
+    price = float(signal.get('avg_price') or signal.get('price') or 0)
+    side = str(signal.get('side') or '').upper()
+    reason = signal.get('reason') or signal.get('broker_status') or 'live_fill'
+    if qty <= 0 or price <= 0:
+        log.error(f"  Live order {signal_id} filled without usable qty/price; leaving unapplied")
+        return position, total_pnl, total_trades, winning_trades, False
+
+    action = infer_signal_action(signal, position)
+    log.info(f"  Applying live fill {signal_id}: action={action} side={side} qty={qty} price={price}")
+
+    if action == 'entry':
+        position = {'qty': qty, 'side': side or 'BUY', 'entry': price, 'max_pnl_pct': 0}
+        record_trade(conn, deploy_id, signal.get('symbol') or '', side or 'BUY', qty, price, 0, reason)
+    else:
+        entry = float(position.get('entry') or price)
+        pos_side = str(position.get('side') or 'BUY').upper()
+        pnl = (price - entry) * qty if pos_side == 'BUY' else (entry - price) * qty
+        record_trade(conn, deploy_id, signal.get('symbol') or '', side or 'SELL', qty, price, pnl, reason)
+        total_pnl += pnl
+        total_trades += 1
+        if pnl > 0:
+            winning_trades += 1
+        position = {'qty': 0, 'side': '', 'entry': 0, 'max_pnl_pct': 0}
+
+    mark_signal_applied(conn, signal_id)
+    return position, total_pnl, total_trades, winning_trades, False
 
 
 def _normalize_symbol(s: str) -> str:
@@ -171,11 +321,15 @@ def get_current_price(conn, symbol: str) -> float:
     Tries exact match first, then normalized match to handle symbol format
     differences (e.g., BTC/USD vs BTCUSD, NSE:RELIANCE vs RELIANCE).
     """
-    # Try exact match first
-    row = conn.execute(
-        "SELECT price FROM strategy_price_cache WHERE symbol = ? ORDER BY updated_at DESC LIMIT 1",
-        (symbol,)
-    ).fetchone()
+    try:
+        row = conn.execute(
+            "SELECT price FROM strategy_price_cache WHERE symbol = ? ORDER BY updated_at DESC LIMIT 1",
+            (symbol,)
+        ).fetchone()
+    except sqlite3.OperationalError as e:
+        if "no such table" in str(e).lower():
+            return 0.0
+        raise
     if row:
         log.debug(f"  get_current_price({symbol}) = {row[0]} (exact match)")
         return row[0]
@@ -196,6 +350,143 @@ def get_current_price(conn, symbol: str) -> float:
 
     log.warning(f"  get_current_price({symbol}) = 0.0 (NO MATCH in price cache)")
     return 0.0
+
+
+def _yf_interval(timeframe: str) -> str:
+    mapping = {
+        "live": "1m",
+        "1m": "1m",
+        "3m": "5m",
+        "5m": "5m",
+        "10m": "15m",
+        "15m": "15m",
+        "30m": "30m",
+        "1h": "60m",
+        "4h": "60m",
+        "1d": "1d",
+    }
+    return mapping.get(timeframe, "5m")
+
+
+def _yf_period(timeframe: str) -> str:
+    if timeframe in {"live", "1m"}:
+        return "5d"
+    if timeframe in {"3m", "5m", "10m", "15m", "30m", "1h", "4h"}:
+        return "60d"
+    return "1y"
+
+
+def _yf_cache_ttl(timeframe: str) -> int:
+    if timeframe in {"live", "1m"}:
+        return 30
+    if timeframe in {"3m", "5m", "10m", "15m"}:
+        return 60
+    if timeframe in {"30m", "1h", "4h"}:
+        return 180
+    return 900
+
+
+def _yf_candidates(symbol: str):
+    raw = symbol.strip()
+    upper = raw.upper()
+    candidates = []
+
+    def add(value):
+        value = value.strip()
+        if value and value not in candidates:
+            candidates.append(value)
+
+    add(raw)
+    if ":" in raw:
+        exchange, base = raw.split(":", 1)
+        add(base)
+        if exchange.upper() in {"NSE", "NFO"}:
+            add(base + ".NS")
+        if exchange.upper() in {"BSE", "BFO"}:
+            add(base + ".BO")
+    if "/" in raw:
+        add(raw.replace("/", "-"))
+    if upper.endswith("USDT") and len(upper) > 4:
+        add(upper[:-4] + "-USD")
+    if upper.endswith("USD") and "-" not in upper and len(upper) > 3:
+        add(upper[:-3] + "-USD")
+    if "." not in raw and ":" not in raw and "-" not in raw and "/" not in raw:
+        add(raw + ".NS")
+        add(raw + ".BO")
+    return candidates
+
+
+def cache_market_snapshot(conn, symbol: str, timeframe: str, df: pd.DataFrame):
+    if df.empty:
+        return
+    try:
+        latest = df.iloc[-1]
+        _db_execute_with_retry(
+            conn,
+            """INSERT INTO strategy_price_cache (symbol, price, updated_at)
+               VALUES (?, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(symbol) DO UPDATE SET
+                  price = excluded.price,
+                  updated_at = CURRENT_TIMESTAMP""",
+            (symbol, float(latest["close"])),
+        )
+        rows = []
+        for _, row in df.tail(300).iterrows():
+            rows.append((
+                symbol, timeframe, int(row["open_time"]),
+                float(row["open"]), float(row["high"]), float(row["low"]),
+                float(row["close"]), float(row.get("volume", 0) or 0),
+            ))
+        conn.executemany(
+            """INSERT OR REPLACE INTO candle_cache
+               (symbol, timeframe, open_time, o, h, l, c, volume, is_closed, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)""",
+            rows,
+        )
+        conn.commit()
+    except Exception as e:
+        log.warning(f"Could not cache yfinance snapshot for {symbol}: {e}")
+
+
+def fetch_candles_from_yfinance(conn, symbol: str, timeframe: str, limit: int = 200) -> pd.DataFrame:
+    if yf is None:
+        return pd.DataFrame(columns=["open_time", "open", "high", "low", "close", "volume"])
+
+    cache_key = (symbol, timeframe, limit)
+    now = time.time()
+    cached = _YF_CACHE.get(cache_key)
+    if cached and now - cached["ts"] < _yf_cache_ttl(timeframe):
+        return cached["df"].copy()
+
+    interval = _yf_interval(timeframe)
+    period = _yf_period(timeframe)
+
+    for candidate in _yf_candidates(symbol):
+        try:
+            hist = yf.Ticker(candidate).history(period=period, interval=interval, auto_adjust=False, prepost=False)
+            if hist is None or hist.empty:
+                continue
+            hist = hist.tail(limit).copy()
+            hist.reset_index(inplace=True)
+            time_col = "Datetime" if "Datetime" in hist.columns else "Date"
+            out = pd.DataFrame({
+                "open_time": pd.to_datetime(hist[time_col]).astype("int64") // 10**9,
+                "open": hist["Open"].astype(float),
+                "high": hist["High"].astype(float),
+                "low": hist["Low"].astype(float),
+                "close": hist["Close"].astype(float),
+                "volume": hist["Volume"].fillna(0).astype(float),
+            }).dropna(subset=["open", "high", "low", "close"])
+            if out.empty:
+                continue
+            _YF_CACHE[cache_key] = {"ts": now, "df": out}
+            cache_market_snapshot(conn, symbol, timeframe, out)
+            log.info(f"  yfinance fallback loaded {len(out)} candles via {candidate} interval={interval}")
+            return out.copy()
+        except Exception as e:
+            log.debug(f"  yfinance fallback failed for {candidate}: {e}")
+
+    return pd.DataFrame(columns=["open_time", "open", "high", "low", "close", "volume"])
 
 
 def check_risk_management(current_price: float, position: dict, strategy: dict) -> str:
@@ -239,6 +530,7 @@ def main():
     parser.add_argument('--mode', default='paper', choices=['paper', 'live'])
     parser.add_argument('--timeframe', default='5m')
     parser.add_argument('--quantity', type=float, default=1.0)
+    parser.add_argument('--account-id', default='')
     parser.add_argument('--db', required=True)
     args = parser.parse_args()
 
@@ -251,6 +543,7 @@ def main():
     log.info(f"  mode       = {args.mode}")
     log.info(f"  timeframe  = {args.timeframe}")
     log.info(f"  quantity   = {args.quantity}")
+    log.info(f"  account_id = {args.account_id}")
     log.info(f"  db         = {args.db}")
     log.info(f"  pid        = {os.getpid()}")
     log.info("=" * 70)
@@ -258,6 +551,12 @@ def main():
     # Open shared DB connection (WAL mode for concurrent host access)
     conn = open_db_connection(args.db)
     log.info("Shared DB connection opened (WAL mode)")
+
+    if args.mode == "live" and not args.account_id:
+        log.error("Live mode requires --account-id")
+        update_deployment_status(conn, args.deploy_id, 'error', 'Live mode requires an account id')
+        conn.close()
+        sys.exit(1)
 
     # Load strategy
     strategy = load_strategy(conn, args.strategy_id)
@@ -277,13 +576,10 @@ def main():
     entry_conds = strategy['entry_conditions']
     exit_conds = strategy['exit_conditions']
 
-    # State
-    position = {'qty': 0, 'side': '', 'entry': 0, 'max_pnl_pct': 0}
-    total_pnl = 0.0
-    total_trades = 0
-    winning_trades = 0
-    max_drawdown = 0.0
-    peak_pnl = 0.0
+    # State. Metrics are persisted so a restarted live runner does not duplicate entries.
+    position, total_pnl, total_trades, winning_trades, max_drawdown, peak_pnl = load_runtime_state(conn, args.deploy_id)
+    if position['qty']:
+        log.info(f"Resumed position from metrics: {position['side']} qty={position['qty']} entry={position['entry']}")
     last_candle_time = 0
     loop_count = 0
 
@@ -295,9 +591,42 @@ def main():
     while running:
         loop_count += 1
         try:
+            if not should_continue(conn, args.deploy_id):
+                log.info("Stop requested by host DB status")
+                break
+
+            if args.mode == 'live':
+                pending_signal = load_unapplied_order_signal(conn, args.deploy_id)
+                if pending_signal:
+                    position, total_pnl, total_trades, winning_trades, _waiting_for_fill = apply_live_order_signal(
+                        conn, args.deploy_id, pending_signal, position, total_pnl, total_trades, winning_trades
+                    )
+                    update_metrics(conn, args.deploy_id, {
+                        'total_pnl': total_pnl,
+                        'unrealized_pnl': 0,
+                        'total_trades': total_trades,
+                        'win_rate': (winning_trades / total_trades * 100) if total_trades > 0 else 0,
+                        'max_drawdown': max_drawdown,
+                        'current_position_qty': position['qty'],
+                        'current_position_side': position['side'],
+                        'current_position_entry': position['entry'],
+                    })
+                    time.sleep(min(check_interval, 5))
+                    continue
+
             # Load candles (live mode needs fewer rows since each row is a tick)
             candle_limit = 50 if is_live else 200
-            df = load_candles_from_db(args.db, args.symbol, args.timeframe, limit=candle_limit)
+            try:
+                df = load_candles_from_db(args.db, args.symbol, args.timeframe, limit=candle_limit)
+            except Exception as e:
+                log.warning(f"[loop#{loop_count}] candle_cache read failed: {e}")
+                df = pd.DataFrame(columns=["open_time", "open", "high", "low", "close", "volume"])
+
+            if df.empty or len(df) < 2:
+                yf_df = fetch_candles_from_yfinance(conn, args.symbol, args.timeframe, limit=candle_limit)
+                if not yf_df.empty and len(yf_df) >= 2:
+                    df = yf_df
+
             if df.empty or len(df) < 2:
                 if loop_count <= 5 or loop_count % 20 == 0:
                     log.warning(f"[loop#{loop_count}] Candle data insufficient: {len(df)} rows (need >=2) for {args.symbol}@{args.timeframe}")
@@ -356,16 +685,18 @@ def main():
                     if args.mode == 'paper':
                         record_trade(conn, args.deploy_id, args.symbol, 'SELL' if position['side'] == 'BUY' else 'BUY',
                                      abs(position['qty']), current_price, pnl, risk_exit)
+                        total_pnl += pnl
+                        total_trades += 1
+                        if pnl > 0:
+                            winning_trades += 1
+                        position = {'qty': 0, 'side': '', 'entry': 0, 'max_pnl_pct': 0}
                     else:
-                        create_order_signal(conn, args.deploy_id, args.symbol,
+                        create_order_signal(conn, args.deploy_id, args.account_id, args.symbol,
                                             'SELL' if position['side'] == 'BUY' else 'BUY',
-                                            abs(position['qty']))
-
-                    total_pnl += pnl
-                    total_trades += 1
-                    if pnl > 0:
-                        winning_trades += 1
-                    position = {'qty': 0, 'side': '', 'entry': 0, 'max_pnl_pct': 0}
+                                            abs(position['qty']), price=current_price, reason=risk_exit)
+                        log.info("  Live risk-exit order signal queued; waiting for broker fill before closing local position")
+                        time.sleep(min(check_interval, 5))
+                        continue
 
             # Evaluate conditions
             verbose_log = not is_live or loop_count <= 3 or loop_count % 100 == 0
@@ -380,25 +711,27 @@ def main():
                                  f"{'ERROR: '+d.get('error','') if d.get('error') else ''}")
                 if entry_result['result']:
                     log.info(f"  >>> ENTRY SIGNAL FIRED! BUY {args.quantity} @ {current_price}")
-                    # Enter position
-                    position = {
-                        'qty': args.quantity,
-                        'side': 'BUY',
-                        'entry': current_price,
-                        'max_pnl_pct': 0,
-                    }
-
                     # Position size warning (#18)
                     order_value = args.quantity * current_price
                     if order_value > MAX_ORDER_VALUE_WARNING:
                         log.warning(f"  HIGH ORDER VALUE: {args.quantity} x {current_price} = {order_value:.2f} (exceeds {MAX_ORDER_VALUE_WARNING})")
 
+                    reason = f'entry_signal: {json.dumps([d.get("indicator", "") for d in entry_result.get("details", [])])}'
                     if args.mode == 'paper':
+                        position = {
+                            'qty': args.quantity,
+                            'side': 'BUY',
+                            'entry': current_price,
+                            'max_pnl_pct': 0,
+                        }
                         record_trade(conn, args.deploy_id, args.symbol, 'BUY',
-                                     args.quantity, current_price, 0,
-                                     f'entry_signal: {json.dumps([d.get("indicator", "") for d in entry_result.get("details", [])])}')
+                                     args.quantity, current_price, 0, reason)
                     else:
-                        create_order_signal(conn, args.deploy_id, args.symbol, 'BUY', args.quantity)
+                        create_order_signal(conn, args.deploy_id, args.account_id, args.symbol, 'BUY',
+                                            args.quantity, price=current_price, reason=reason)
+                        log.info("  Live entry order signal queued; waiting for broker fill before opening local position")
+                        time.sleep(min(check_interval, 5))
+                        continue
 
             else:
                 # In position: check exit conditions
@@ -421,16 +754,19 @@ def main():
                                      'SELL' if position['side'] == 'BUY' else 'BUY',
                                      abs(position['qty']), current_price, pnl,
                                      f'exit_signal: {json.dumps([d.get("indicator", "") for d in exit_result.get("details", [])])}')
+                        total_pnl += pnl
+                        total_trades += 1
+                        if pnl > 0:
+                            winning_trades += 1
+                        position = {'qty': 0, 'side': '', 'entry': 0, 'max_pnl_pct': 0}
                     else:
-                        create_order_signal(conn, args.deploy_id, args.symbol,
+                        reason = f'exit_signal: {json.dumps([d.get("indicator", "") for d in exit_result.get("details", [])])}'
+                        create_order_signal(conn, args.deploy_id, args.account_id, args.symbol,
                                             'SELL' if position['side'] == 'BUY' else 'BUY',
-                                            abs(position['qty']))
-
-                    total_pnl += pnl
-                    total_trades += 1
-                    if pnl > 0:
-                        winning_trades += 1
-                    position = {'qty': 0, 'side': '', 'entry': 0, 'max_pnl_pct': 0}
+                                            abs(position['qty']), price=current_price, reason=reason)
+                        log.info("  Live exit order signal queued; waiting for broker fill before closing local position")
+                        time.sleep(min(check_interval, 5))
+                        continue
 
             # Update metrics
             unrealized = 0

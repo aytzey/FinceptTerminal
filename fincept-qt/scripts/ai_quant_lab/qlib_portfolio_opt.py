@@ -468,7 +468,7 @@ class PortfolioOptimizationService:
             j = df.values - num_items
             sorted_items[i] = link[j, 0]
             df = pd.Series(link[j, 1], index=i+1)
-            sorted_items = sorted_items.append(df)
+            sorted_items = pd.concat([sorted_items, df])
             sorted_items = sorted_items.sort_index()
             sorted_items.index = range(sorted_items.shape[0])
 
@@ -482,6 +482,14 @@ def main():
         sys.exit(1)
 
     command = sys.argv[1]
+    command_aliases = {
+        "hrp": "hierarchical_risk_parity",
+        "min_variance": "minimum_variance",
+        "min_var": "minimum_variance",
+        "max_sharpe": "maximum_sharpe",
+        "max_sr": "maximum_sharpe",
+    }
+    command = command_aliases.get(command, command)
     service = PortfolioOptimizationService()
 
     try:
@@ -498,7 +506,7 @@ def main():
             }
 
         elif command == "black_litterman":
-            cov_raw = params.get("cov_matrix", [])
+            cov_raw = params.get("cov_matrix") or params.get("covariance_matrix", [])
             assets = params.get("assets", [f"A{i}" for i in range(len(cov_raw))])
             result = service.black_litterman(
                 market_caps=pd.Series(params.get("market_caps", []), index=assets),
@@ -511,14 +519,14 @@ def main():
             )
 
         elif command == "hierarchical_risk_parity":
-            cov_raw = params.get("cov_matrix", [])
+            cov_raw = params.get("cov_matrix") or params.get("covariance_matrix", [])
             assets = params.get("assets", [f"A{i}" for i in range(len(cov_raw))])
             result = service.hierarchical_risk_parity(
                 cov_matrix=pd.DataFrame(cov_raw, index=assets, columns=assets)
             )
 
         elif command == "minimum_variance":
-            cov_raw = params.get("cov_matrix", [])
+            cov_raw = params.get("cov_matrix") or params.get("covariance_matrix", [])
             assets = params.get("assets", [f"A{i}" for i in range(len(cov_raw))])
             result = service.minimum_variance_portfolio(
                 cov_matrix=pd.DataFrame(cov_raw, index=assets, columns=assets),
@@ -526,7 +534,7 @@ def main():
             )
 
         elif command == "maximum_sharpe":
-            cov_raw = params.get("cov_matrix", [])
+            cov_raw = params.get("cov_matrix") or params.get("covariance_matrix", [])
             assets = params.get("assets", [f"A{i}" for i in range(len(cov_raw))])
             result = service.maximum_sharpe_portfolio(
                 expected_returns=pd.Series(params.get("expected_returns", []), index=assets),
@@ -536,7 +544,7 @@ def main():
             )
 
         elif command == "efficient_frontier":
-            cov_raw = params.get("cov_matrix", [])
+            cov_raw = params.get("cov_matrix") or params.get("covariance_matrix", [])
             assets = params.get("assets", [f"A{i}" for i in range(len(cov_raw))])
             result = service.efficient_frontier(
                 expected_returns=pd.Series(params.get("expected_returns", []), index=assets),

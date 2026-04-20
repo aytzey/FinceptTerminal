@@ -2,14 +2,23 @@
 #include "services/algo_trading/AlgoTradingService.h"
 
 #include "core/config/AppPaths.h"
+#include "core/config/ProfileManager.h"
 #include "core/logging/Logger.h"
 #include "python/PythonRunner.h"
 #include "storage/cache/CacheManager.h"
+#include "storage/sqlite/Database.h"
+#include "trading/AccountManager.h"
+#include "trading/UnifiedTrading.h"
 
 #include <QFile>
+#include <QFileInfo>
+#include <QCoreApplication>
 #include <QJsonDocument>
 #include <QPointer>
+#include <QProcess>
 #include <QUuid>
+
+#include <cmath>
 
 namespace fincept::services::algo {
 
@@ -21,6 +30,76 @@ static constexpr const char* kDeploymentsCacheKey = "algo:deployments";
 // ── DB path helper ────────────────────────────────────────────────────────────
 static QString algo_db_path() {
     return fincept::AppPaths::data() + "/fincept.db";
+}
+
+static QString normalize_mode(QString mode) {
+    mode = mode.trimmed().toLower();
+    return mode == "live" ? "live" : "paper";
+}
+
+static QString resolve_live_account(const QString& requested_account_id, QString* error) {
+    auto& accounts = fincept::trading::AccountManager::instance();
+
+    if (!requested_account_id.trimmed().isEmpty()) {
+        const auto account = accounts.get_account(requested_account_id.trimmed());
+        if (account.account_id.isEmpty()) {
+            if (error)
+                *error = "Live deployment account not found: " + requested_account_id;
+            return {};
+        }
+        if (!account.is_active || account.trading_mode != "live") {
+            if (error)
+                *error = "Selected account must be active and in live mode for live deployment.";
+            return {};
+        }
+        return account.account_id;
+    }
+
+    QStringList live_ids;
+    for (const auto& account : accounts.active_accounts()) {
+        if (account.trading_mode == "live")
+            live_ids.append(account.account_id);
+    }
+    if (live_ids.size() == 1)
+        return live_ids.first();
+
+    if (error) {
+        *error = live_ids.isEmpty()
+                     ? "Live deployment requires an active live broker account."
+                     : "Live deployment requires selecting one live broker account.";
+    }
+    return {};
+}
+
+static bool update_deployment_error(const QString& deploy_id, const QString& message) {
+    auto r = fincept::Database::instance().execute(
+        "UPDATE algo_deployments SET status = 'error', error_message = ?, updated_at = CURRENT_TIMESTAMP "
+        "WHERE id = ?",
+        {message, deploy_id});
+    if (r.is_err()) {
+        LOG_ERROR("AlgoTrading", QString("Failed to update deployment error: %1")
+                                     .arg(QString::fromStdString(r.error())));
+        return false;
+    }
+    return true;
+}
+
+static void ensure_bot_daemon_running() {
+    const QString exe = QCoreApplication::applicationFilePath();
+    if (exe.isEmpty())
+        return;
+
+    QStringList args{"--bot-daemon"};
+    const QString profile = fincept::ProfileManager::instance().active();
+    if (!profile.isEmpty())
+        args << "--profile" << profile;
+
+    qint64 pid = -1;
+    if (QProcess::startDetached(exe, args, QFileInfo(exe).absolutePath(), &pid)) {
+        LOG_INFO("AlgoTrading", QString("Bot daemon ensured: pid=%1").arg(pid));
+    } else {
+        LOG_WARN("AlgoTrading", "Could not start bot daemon process");
+    }
 }
 
 AlgoTradingService& AlgoTradingService::instance() {
@@ -134,19 +213,115 @@ void AlgoTradingService::delete_strategy(const QString& id) {
 
 // ── Deployment lifecycle ──────────────────────────────────────────────────────
 void AlgoTradingService::deploy_strategy(const QString& strategy_id, const QString& symbol, const QString& mode,
-                                         const QString& timeframe, double quantity) {
+                                         const QString& timeframe, double quantity, const QString& account_id) {
+    const QString clean_symbol = symbol.trimmed();
+    const QString clean_mode = normalize_mode(mode);
+    const QString clean_timeframe = timeframe.trimmed().isEmpty() ? "5m" : timeframe.trimmed();
+
+    if (strategy_id.trimmed().isEmpty()) {
+        emit error_occurred("deploy", "Strategy id is required.");
+        return;
+    }
+    if (clean_symbol.isEmpty()) {
+        emit error_occurred("deploy", "Symbol is required.");
+        return;
+    }
+    if (!std::isfinite(quantity) || quantity <= 0.0) {
+        emit error_occurred("deploy", "Quantity must be greater than zero.");
+        return;
+    }
+
+    QString resolved_account_id;
+    if (clean_mode == "live") {
+        QString account_error;
+        resolved_account_id = resolve_live_account(account_id, &account_error);
+        if (resolved_account_id.isEmpty()) {
+            emit error_occurred("deploy", account_error);
+            return;
+        }
+    }
+
     auto deploy_id = QUuid::createUuid().toString(QUuid::WithoutBraces);
-    // algo_live_runner is a long-running process — start and don't wait for completion
-    run_python("algo_trading/algo_live_runner.py",
-               {"--deploy-id", deploy_id, "--strategy-id", strategy_id, "--symbol", symbol, "--mode", mode,
-                "--timeframe", timeframe, "--quantity", QString::number(quantity), "--db", algo_db_path()},
-               "deploy", [this, deploy_id](bool ok, const QString& out) {
-                   if (!ok) {
-                       emit error_occurred("deploy", out);
-                       return;
-                   }
-                   emit deployment_started(deploy_id);
-               });
+
+    const auto insert = fincept::Database::instance().execute(
+        "INSERT INTO algo_deployments "
+        "(id, strategy_id, account_id, symbol, mode, status, timeframe, quantity, error_message, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, 'starting', ?, ?, '', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        {deploy_id, strategy_id.trimmed(),
+         resolved_account_id.isEmpty() ? QVariant(QMetaType(QMetaType::QString)) : QVariant(resolved_account_id),
+         clean_symbol, clean_mode, clean_timeframe, quantity});
+    if (insert.is_err()) {
+        emit error_occurred("deploy", QString("Failed to create deployment row: %1")
+                                          .arg(QString::fromStdString(insert.error())));
+        return;
+    }
+
+    auto& runner = python::PythonRunner::instance();
+    const QString python_exe = runner.python_path();
+    if (python_exe.isEmpty()) {
+        const QString msg = "Python not available — run first-time setup from the app.";
+        update_deployment_error(deploy_id, msg);
+        emit error_occurred("deploy", msg);
+        return;
+    }
+
+    const QString script_path = runner.scripts_dir() + "/algo_trading/algo_live_runner.py";
+    if (!QFileInfo::exists(script_path)) {
+        const QString msg = "Script not found: " + script_path;
+        update_deployment_error(deploy_id, msg);
+        emit error_occurred("deploy", msg);
+        return;
+    }
+
+    QStringList args{
+        script_path,
+        "--deploy-id", deploy_id,
+        "--strategy-id", strategy_id.trimmed(),
+        "--symbol", clean_symbol,
+        "--mode", clean_mode,
+        "--timeframe", clean_timeframe,
+        "--quantity", QString::number(quantity, 'g', 16),
+        "--db", algo_db_path(),
+    };
+    if (!resolved_account_id.isEmpty())
+        args << "--account-id" << resolved_account_id;
+
+    QProcess proc;
+    proc.setProgram(python_exe);
+    proc.setArguments(args);
+    proc.setWorkingDirectory(runner.scripts_dir());
+    proc.setProcessEnvironment(runner.build_python_env());
+
+#ifdef _WIN32
+    proc.setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments* cpa) {
+        cpa->flags |= 0x08000000; // CREATE_NO_WINDOW
+    });
+#endif
+
+    qint64 pid = -1;
+    if (!proc.startDetached(&pid)) {
+        const QString msg = "Failed to start algo live runner: " + proc.errorString();
+        update_deployment_error(deploy_id, msg);
+        emit error_occurred("deploy", msg);
+        return;
+    }
+
+    fincept::Database::instance().execute(
+        "UPDATE algo_deployments SET pid = ?, started_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP "
+        "WHERE id = ?",
+        {QVariant::fromValue<qlonglong>(pid), deploy_id});
+
+    if (clean_mode == "live") {
+        ensure_bot_daemon_running();
+        fincept::trading::UnifiedTrading::instance().start_order_bridge();
+    }
+
+    fincept::CacheManager::instance().remove(kDeploymentsCacheKey);
+    emit deployment_started(deploy_id);
+    LOG_INFO("AlgoTrading", QString("Deployment started: %1 pid=%2 mode=%3 symbol=%4")
+                                .arg(deploy_id)
+                                .arg(pid)
+                                .arg(clean_mode, clean_symbol));
 }
 
 void AlgoTradingService::stop_deployment(const QString& deployment_id) {
@@ -156,6 +331,7 @@ void AlgoTradingService::stop_deployment(const QString& deployment_id) {
                        emit error_occurred("stop_deployment", out);
                        return;
                    }
+                   fincept::CacheManager::instance().remove(kDeploymentsCacheKey);
                    emit deployment_stopped(deployment_id);
                });
 }
@@ -167,6 +343,7 @@ void AlgoTradingService::stop_all_deployments() {
                        emit error_occurred("stop_all", out);
                        return;
                    }
+                   fincept::CacheManager::instance().remove(kDeploymentsCacheKey);
                    LOG_INFO("AlgoTrading", "All deployments stopped");
                });
 }
@@ -180,6 +357,8 @@ static QVector<AlgoDeployment> parse_deployments(const QJsonArray& arr) {
         d.id = o["id"].toString();
         d.strategy_id = o["strategy_id"].toString();
         d.strategy_name = o["strategy_name"].toString();
+        d.account_id = o["account_id"].toString();
+        d.account_name = o["account_name"].toString();
         d.symbol = o["symbol"].toString();
         d.mode = o["mode"].toString();
         d.status = o["status"].toString();

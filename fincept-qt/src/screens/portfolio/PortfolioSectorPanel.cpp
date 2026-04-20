@@ -440,6 +440,7 @@ QString PortfolioSectorPanel::infer_sector(const QString& sym) {
         {"LINK-USD", "Cryptocurrency"},
         {"LTC-USD", "Cryptocurrency"},
         {"UNI-USD", "Cryptocurrency"},
+        {"UNI7083-USD", "Cryptocurrency"},
         {"ATOM-USD", "Cryptocurrency"},
         {"NEAR-USD", "Cryptocurrency"},
         {"ALGO-USD", "Cryptocurrency"},

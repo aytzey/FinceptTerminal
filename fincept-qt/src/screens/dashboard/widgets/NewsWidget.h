@@ -1,7 +1,7 @@
 #pragma once
 #include "screens/dashboard/widgets/BaseWidget.h"
+#include "services/news/NewsService.h"
 
-#include <QJsonArray>
 #include <QScrollArea>
 
 namespace fincept::screens::widgets {
@@ -18,11 +18,11 @@ class NewsWidget : public BaseWidget {
   private:
     void apply_styles();
     void refresh_data();
-    void populate(const QJsonArray& articles);
+    void populate(const QVector<services::NewsArticle>& articles);
 
     QScrollArea* scroll_area_ = nullptr;
     QVBoxLayout* news_layout_ = nullptr;
-    QJsonArray last_articles_; // cached for theme-change re-populate
+    QVector<services::NewsArticle> last_articles_; // cached for theme-change re-populate
 };
 
 } // namespace fincept::screens::widgets

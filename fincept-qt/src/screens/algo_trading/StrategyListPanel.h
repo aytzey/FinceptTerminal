@@ -24,12 +24,14 @@ class StrategyListPanel : public QWidget {
     void on_error(const QString& context, const QString& msg);
     void on_filter_changed(const QString& text);
     void go_to_page(int page);
+    void deploy_selected_strategy();
 
   private:
     void build_ui();
     void connect_service();
     void render_page();
     void update_pagination_controls();
+    void refresh_account_combo();
 
     static constexpr int kPageSize = 50;
 
@@ -37,6 +39,13 @@ class StrategyListPanel : public QWidget {
     QLabel*       count_label_   = nullptr;
     QComboBox*    sort_combo_    = nullptr;
     QComboBox*    cat_combo_     = nullptr;
+    QLineEdit*    deploy_symbol_ = nullptr;
+    QLineEdit*    deploy_qty_    = nullptr;
+    QComboBox*    deploy_mode_   = nullptr;
+    QComboBox*    deploy_tf_     = nullptr;
+    QComboBox*    deploy_account_ = nullptr;
+    QLabel*       deploy_status_ = nullptr;
+    QPushButton*  deploy_btn_    = nullptr;
     QTableWidget* table_         = nullptr;
     QLabel*       page_label_    = nullptr;
     QPushButton*  prev_btn_      = nullptr;

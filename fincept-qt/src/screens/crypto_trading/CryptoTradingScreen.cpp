@@ -115,6 +115,8 @@ void CryptoTradingScreen::hideEvent(QHideEvent* event) {
     // decrement live_inflight_; we just zero the counter so a spurious extra
     // decrement from a stuck task doesn't underflow into negative values.
     candles_fetching_.store(false);
+    orderbook_fetching_.store(false);
+    watchlist_fetching_.store(false);
     live_inflight_.store(0);
     // paper_bookkeeping_in_flight_ is NOT cleared — a worker thread may still
     // be running and will reset it via the invokeMethod callback when done.
@@ -922,6 +924,8 @@ void CryptoTradingScreen::refresh_ticker() {
 void CryptoTradingScreen::refresh_orderbook() {
     if (!initialized_)
         return;
+    if (orderbook_fetching_.exchange(true))
+        return;
     QPointer<CryptoTradingScreen> self = this;
     QtConcurrent::run([self]() {
         if (!self)
@@ -932,6 +936,7 @@ void CryptoTradingScreen::refresh_orderbook() {
             [self, ob]() {
                 if (!self)
                     return;
+                self->orderbook_fetching_ = false;
                 self->orderbook_->set_data(ob.bids, ob.asks, ob.spread, ob.spread_pct);
                 self->bottom_panel_->set_depth_data(ob.bids, ob.asks, ob.spread, ob.spread_pct);
             },
@@ -988,6 +993,8 @@ void CryptoTradingScreen::refresh_portfolio() {
 void CryptoTradingScreen::refresh_watchlist() {
     if (!initialized_)
         return;
+    if (watchlist_fetching_.exchange(true))
+        return;
     QPointer<CryptoTradingScreen> self = this;
     QtConcurrent::run([self]() {
         if (!self)
@@ -998,6 +1005,7 @@ void CryptoTradingScreen::refresh_watchlist() {
             [self, tickers]() {
                 if (!self)
                     return;
+                self->watchlist_fetching_ = false;
                 self->watchlist_->update_prices(tickers);
             },
             Qt::QueuedConnection);

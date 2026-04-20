@@ -27,6 +27,7 @@
 #include "services/news/NewsService.h"
 #include "services/polymarket/PolymarketWebSocket.h"
 #include "services/relationship_map/RelationshipMapService.h"
+#include "trading/UnifiedTrading.h"
 #include "trading/DataStreamManager.h"
 #include "trading/ExchangeService.h"
 #include "storage/repositories/NewsArticleRepository.h"
@@ -39,6 +40,7 @@
 
 #include <QDir>
 #include <QFile>
+#include <QCoreApplication>
 #include <QLockFile>
 #include <QPointer>
 #include <QSqlDatabase>
@@ -53,13 +55,112 @@
 #    include <Windows.h>
 #endif
 
+namespace {
+
+void register_all_migrations() {
+    // Register migrations explicitly (avoids MSVC /OPT:REF stripping static-init TUs)
+    fincept::register_migration_v001();
+    fincept::register_migration_v002();
+    fincept::register_migration_v003();
+    fincept::register_migration_v004();
+    fincept::register_migration_v005();
+    fincept::register_migration_v006();
+    fincept::register_migration_v007();
+    fincept::register_migration_v008();
+    fincept::register_migration_v009();
+    fincept::register_migration_v010();
+    fincept::register_migration_v011();
+    fincept::register_migration_v012();
+    fincept::register_migration_v013();
+    fincept::register_migration_v014();
+    fincept::register_migration_v015();
+    fincept::register_migration_v016();
+    fincept::register_migration_v017();
+    fincept::register_migration_v018();
+    fincept::register_migration_v019();
+    fincept::register_migration_v020();
+    fincept::register_migration_v021();
+    fincept::register_migration_v022();
+    fincept::register_migration_v023();
+}
+
+void install_qt_message_handler() {
+    qInstallMessageHandler([](QtMsgType type, const QMessageLogContext& ctx, const QString& msg) {
+        const char* category = (ctx.category && *ctx.category) ? ctx.category : "Qt";
+        switch (type) {
+        case QtDebugMsg:    fincept::Logger::instance().debug(category, msg); break;
+        case QtInfoMsg:     fincept::Logger::instance().info(category, msg); break;
+        case QtWarningMsg:  fincept::Logger::instance().warn(category, msg); break;
+        case QtCriticalMsg: fincept::Logger::instance().error(category, msg); break;
+        case QtFatalMsg:
+            fincept::Logger::instance().error(category, msg);
+            fincept::Logger::instance().flush_and_close();
+            break;
+        }
+    });
+}
+
+int run_bot_daemon(int argc, char* argv[]) {
+    QCoreApplication app(argc, argv);
+    app.setApplicationName("FinceptTerminalBot");
+    app.setOrganizationName("Fincept");
+#ifndef FINCEPT_VERSION_STRING
+#    define FINCEPT_VERSION_STRING "0.0.0-dev"
+#endif
+    app.setApplicationVersion(QStringLiteral(FINCEPT_VERSION_STRING));
+
+    fincept::AppPaths::ensure_all();
+
+    QLockFile bot_lock(fincept::AppPaths::data() + "/fincept-bot-daemon.lock");
+    bot_lock.setStaleLockTime(10'000);
+    if (!bot_lock.tryLock(0))
+        return 0;
+
+    fincept::Logger::instance().set_file(fincept::AppPaths::logs() + "/fincept.log");
+    install_qt_message_handler();
+    LOG_INFO("BotDaemon", "Fincept headless trading bot daemon starting...");
+
+    auto& config = fincept::AppConfig::instance();
+    fincept::HttpClient::instance().set_base_url(config.api_base_url());
+
+    register_all_migrations();
+    const QString db_path = fincept::AppPaths::data() + "/fincept.db";
+    auto db_result = fincept::Database::instance().open(db_path);
+    if (db_result.is_err()) {
+        LOG_ERROR("BotDaemon", "Failed to open database: " + QString::fromStdString(db_result.error()));
+        return 1;
+    }
+
+    fincept::trading::UnifiedTrading::instance().start_order_bridge();
+    QTimer daemon_keepalive;
+    daemon_keepalive.setInterval(60'000);
+    daemon_keepalive.setTimerType(Qt::VeryCoarseTimer);
+    QObject::connect(&daemon_keepalive, &QTimer::timeout, []() {});
+    daemon_keepalive.start();
+
+    QObject::connect(&app, &QCoreApplication::aboutToQuit, []() {
+        fincept::trading::UnifiedTrading::instance().stop_order_bridge();
+    });
+    LOG_INFO("BotDaemon", "Headless trading bot daemon ready");
+    return app.exec();
+}
+
+} // namespace
+
 int main(int argc, char* argv[]) {
     // ── Parse --profile <name> from argv before Qt initialises ───────────────
     // This must happen first so that:
     //   1. AppPaths returns the correct per-profile directories
     //   2. SingleApplication uses a profile-scoped IPC key so two different
     //      profiles can run simultaneously as independent primary instances
+    bool bot_daemon = false;
     {
+        for (int i = 1; i < argc; ++i) {
+            if (qstrcmp(argv[i], "--bot-daemon") == 0) {
+                bot_daemon = true;
+                break;
+            }
+        }
         for (int i = 1; i < argc - 1; ++i) {
             if (qstrcmp(argv[i], "--profile") == 0) {
                 fincept::ProfileManager::instance().set_active(QString::fromUtf8(argv[i + 1]));
@@ -71,6 +172,9 @@ int main(int argc, char* argv[]) {
         QDir().mkpath(fincept::AppPaths::root());
     }
 
+    if (bot_daemon)
+        return run_bot_daemon(argc, argv);
+
     // Required before QApplication when any dock panel contains an OpenGL widget
     // (Qt Charts, QOpenGLWidget) — prevents black rendering in floating windows.
     QApplication::setAttribute(Qt::AA_ShareOpenGLContexts);
@@ -80,7 +184,9 @@ int main(int argc, char* argv[]) {
     // "FinceptTerminal --profile work" and "FinceptTerminal --profile personal"
     // are treated as two separate primary instances and run simultaneously.
     // allowSecondary=true: secondary instances send "--new-window" and exit.
-    const QString profile_key = QString("FinceptTerminal-%1").arg(fincept::ProfileManager::instance().active());
+    const QString profile_key = QString("FinceptTerminal-%1%2")
+                                    .arg(fincept::ProfileManager::instance().active(),
+                                         bot_daemon ? "-bot-daemon" : "");
     SingleApplication app(argc, argv, /*allowSecondary=*/true, SingleApplication::Mode::User, 100,
                           profile_key.toUtf8());
     app.setApplicationName("FinceptTerminal");
@@ -89,10 +195,14 @@ int main(int argc, char* argv[]) {
 #    define FINCEPT_VERSION_STRING "0.0.0-dev"
 #endif
     app.setApplicationVersion(QStringLiteral(FINCEPT_VERSION_STRING));
+    if (bot_daemon)
+        app.setQuitOnLastWindowClosed(false);
 
     // ── Secondary instance: signal primary to open a new window, then exit ───
     // The primary receives receivedMessage() and calls open_new_window().
     if (app.isSecondary()) {
+        if (bot_daemon)
+            return 0;
 #ifdef Q_OS_WIN
         // Grant the primary process permission to bring its new window to the
         // foreground — Windows blocks focus-steal without this.
@@ -109,30 +219,32 @@ int main(int argc, char* argv[]) {
     // topics and cross-thread queued signals. Phase 0 — see
     // fincept-qt/DATAHUB_ARCHITECTURE.md.
     // Phase 2: register MarketDataService as the `market:quote:*` producer.
-    fincept::datahub::register_metatypes();
-    fincept::services::MarketDataService::instance().ensure_registered_with_hub();
-    // Phase 4: ExchangeService as the ws:kraken:* / ws:hyperliquid:* producer.
-    fincept::trading::ExchangeService::instance().ensure_registered_with_hub();
-    // Phase 4: PolymarketWebSocket as the polymarket:* producer.
-    fincept::services::polymarket::PolymarketWebSocket::instance().ensure_registered_with_hub();
-    // Phase 5: NewsService as the news:general / news:symbol:* /
-    // news:category:* / news:cluster:* producer.
-    fincept::services::NewsService::instance().ensure_registered_with_hub();
-    // Phase 6: Economics + DBnomics + GovData producers.
-    fincept::services::EconomicsService::instance().ensure_registered_with_hub();
-    fincept::services::DBnomicsService::instance().ensure_registered_with_hub();
-    fincept::services::GovDataService::instance().ensure_registered_with_hub();
-    // Phase 7: DataStreamManager as the broker:* producer (positions,
-    // orders, balance, holdings, quote, ticks). Per-account topic shape
-    // `broker:<id>:<account_id>:<channel>`.
-    fincept::trading::DataStreamManager::instance().ensure_registered_with_hub();
-    // Phase 8: Geopolitics / Maritime / RelationshipMap / MAAnalytics.
-    fincept::services::geo::GeopoliticsService::instance().ensure_registered_with_hub();
-    fincept::services::maritime::MaritimeService::instance().ensure_registered_with_hub();
-    fincept::services::RelationshipMapService::instance().ensure_registered_with_hub();
-    fincept::services::ma::MAAnalyticsService::instance().ensure_registered_with_hub();
-    // Phase 9: AgentService as agent:* push-only producer (output/stream/status/routing/error).
-    fincept::services::AgentService::instance().ensure_registered_with_hub();
+    if (!bot_daemon) {
+        fincept::datahub::register_metatypes();
+        fincept::services::MarketDataService::instance().ensure_registered_with_hub();
+        // Phase 4: ExchangeService as the ws:kraken:* / ws:hyperliquid:* producer.
+        fincept::trading::ExchangeService::instance().ensure_registered_with_hub();
+        // Phase 4: PolymarketWebSocket as the polymarket:* producer.
+        fincept::services::polymarket::PolymarketWebSocket::instance().ensure_registered_with_hub();
+        // Phase 5: NewsService as the news:general / news:symbol:* /
+        // news:category:* / news:cluster:* producer.
+        fincept::services::NewsService::instance().ensure_registered_with_hub();
+        // Phase 6: Economics + DBnomics + GovData producers.
+        fincept::services::EconomicsService::instance().ensure_registered_with_hub();
+        fincept::services::DBnomicsService::instance().ensure_registered_with_hub();
+        fincept::services::GovDataService::instance().ensure_registered_with_hub();
+        // Phase 7: DataStreamManager as the broker:* producer (positions,
+        // orders, balance, holdings, quote, ticks). Per-account topic shape
+        // `broker:<id>:<account_id>:<channel>`.
+        fincept::trading::DataStreamManager::instance().ensure_registered_with_hub();
+        // Phase 8: Geopolitics / Maritime / RelationshipMap / MAAnalytics.
+        fincept::services::geo::GeopoliticsService::instance().ensure_registered_with_hub();
+        fincept::services::maritime::MaritimeService::instance().ensure_registered_with_hub();
+        fincept::services::RelationshipMapService::instance().ensure_registered_with_hub();
+        fincept::services::ma::MAAnalyticsService::instance().ensure_registered_with_hub();
+        // Phase 9: AgentService as agent:* push-only producer (output/stream/status/routing/error).
+        fincept::services::AgentService::instance().ensure_registered_with_hub();
+    }
 
     // Create all application directories under %LOCALAPPDATA%\com.fincept.terminal\
     fincept::AppPaths::ensure_all();
@@ -236,27 +348,7 @@ int main(int argc, char* argv[]) {
     // Note: auth tokens are managed by AuthManager::initialize() which loads
     // from SecureStorage (DPAPI) and SQLite — not from QSettings/Registry.
 
-    // Register migrations explicitly (avoids MSVC /OPT:REF stripping static-init TUs)
-    fincept::register_migration_v001();
-    fincept::register_migration_v002();
-    fincept::register_migration_v003();
-    fincept::register_migration_v004();
-    fincept::register_migration_v005();
-    fincept::register_migration_v006();
-    fincept::register_migration_v007();
-    fincept::register_migration_v008();
-    fincept::register_migration_v009();
-    fincept::register_migration_v010();
-    fincept::register_migration_v011();
-    fincept::register_migration_v012();
-    fincept::register_migration_v013();
-    fincept::register_migration_v014();
-    fincept::register_migration_v015();
-    fincept::register_migration_v016();
-    fincept::register_migration_v017();
-    fincept::register_migration_v018();
-    fincept::register_migration_v019();
-    fincept::register_migration_v020();
+    register_all_migrations();
 
     // Open main database
     QString db_path = fincept::AppPaths::data() + "/fincept.db";
@@ -278,6 +370,10 @@ int main(int argc, char* argv[]) {
                 LOG_INFO("App", "News articles pruned (keeping 30 days)");
             });
         }
+
+        QTimer::singleShot(0, []() {
+            fincept::trading::UnifiedTrading::instance().start_order_bridge();
+        });
 
         // Load persisted font settings and apply before any window is shown
         // — eliminates flash/wrong-font-on-startup. Theme is always Obsidian.

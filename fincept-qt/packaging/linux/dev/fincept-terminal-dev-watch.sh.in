@@ -37,6 +37,7 @@ watch_loop() {
         "$APP_DIR/resources" \
         "$APP_DIR/tests" \
         "$APP_DIR/cmake" \
+        "$APP_DIR/scripts" \
         "$APP_DIR/CMakeLists.txt" \
         "$APP_DIR/CMakePresets.json"
 }

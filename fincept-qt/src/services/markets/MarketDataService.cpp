@@ -14,9 +14,54 @@
 #include <QPointer>
 #include <QSet>
 
+#include <cmath>
 #include <memory>
 
 namespace fincept::services {
+
+namespace {
+
+QString normalize_symbol(QString symbol) {
+    return symbol.trimmed().toUpper();
+}
+
+QStringList normalize_symbols(const QStringList& symbols) {
+    QStringList out;
+    QSet<QString> seen;
+    out.reserve(symbols.size());
+    for (const auto& raw : symbols) {
+        const QString symbol = normalize_symbol(raw);
+        if (symbol.isEmpty() || seen.contains(symbol))
+            continue;
+        seen.insert(symbol);
+        out.append(symbol);
+    }
+    return out;
+}
+
+bool is_valid_quote(const QuoteData& q) {
+    return !q.symbol.trimmed().isEmpty() && std::isfinite(q.price) && q.price > 0.0;
+}
+
+bool load_cached_quote(const QString& symbol, QuoteData& out) {
+    const QVariant cv = fincept::CacheManager::instance().get("market:" + symbol);
+    if (cv.isNull())
+        return false;
+
+    const QJsonObject o = QJsonDocument::fromJson(cv.toString().toUtf8()).object();
+    out = {o["symbol"].toString(symbol),
+           o["name"].toString(symbol),
+           o["price"].toDouble(),
+           o["change"].toDouble(),
+           o["change_pct"].toDouble(),
+           o["high"].toDouble(),
+           o["low"].toDouble(),
+           o["volume"].toDouble()};
+    out.symbol = normalize_symbol(out.symbol);
+    return is_valid_quote(out);
+}
+
+} // namespace
 
 MarketDataService& MarketDataService::instance() {
     static MarketDataService s;
@@ -34,10 +79,10 @@ QStringList MarketDataService::topic_patterns() const {
 }
 
 int MarketDataService::max_requests_per_sec() const {
-    // PythonRunner caps at 3 concurrent processes; a batched-quote fetch
-    // is 2–3 s typical. Capping hub-driven refreshes at 2/s keeps at
-    // least one PythonRunner slot for non-quote work.
-    return 2;
+    // Quote refreshes are already collapsed by fetch_quotes()/flush_batch().
+    // Returning 0 lets DataHub pass the whole active topic set in one call
+    // instead of drip-feeding one symbol per scheduler tick.
+    return 0;
 }
 
 void MarketDataService::refresh(const QStringList& topics) {
@@ -157,7 +202,8 @@ void MarketDataService::ensure_registered_with_hub() {
 // ── Batched + Cached fetch_quotes ───────────────────────────────────────────
 
 void MarketDataService::fetch_quotes(const QStringList& symbols, QuoteCallback cb) {
-    if (symbols.isEmpty()) {
+    const QStringList requested_symbols = normalize_symbols(symbols);
+    if (requested_symbols.isEmpty()) {
         cb(true, {});
         return;
     }
@@ -165,13 +211,11 @@ void MarketDataService::fetch_quotes(const QStringList& symbols, QuoteCallback c
     // Check if ALL requested symbols are cached and fresh
     bool all_cached = true;
     QVector<QuoteData> cached_results;
-    for (const auto& sym : symbols) {
-        const QVariant cv = fincept::CacheManager::instance().get("market:" + sym);
-        if (!cv.isNull()) {
-            const QJsonObject o = QJsonDocument::fromJson(cv.toString().toUtf8()).object();
-            cached_results.append({o["symbol"].toString(), o["name"].toString(), o["price"].toDouble(),
-                                   o["change"].toDouble(), o["change_pct"].toDouble(), o["high"].toDouble(),
-                                   o["low"].toDouble(), o["volume"].toDouble()});
+    cached_results.reserve(requested_symbols.size());
+    for (const auto& sym : requested_symbols) {
+        QuoteData cached;
+        if (load_cached_quote(sym, cached)) {
+            cached_results.append(cached);
         } else {
             all_cached = false;
             break;
@@ -183,9 +227,9 @@ void MarketDataService::fetch_quotes(const QStringList& symbols, QuoteCallback c
     }
 
     // Queue for batching
-    pending_.append({symbols, std::move(cb)});
+    pending_.append({requested_symbols, std::move(cb)});
 
-    if (!batch_scheduled_) {
+    if (!batch_scheduled_ && !quote_fetch_in_progress_) {
         batch_scheduled_ = true;
         QTimer::singleShot(100, this, &MarketDataService::flush_batch);
     }
@@ -194,17 +238,30 @@ void MarketDataService::fetch_quotes(const QStringList& symbols, QuoteCallback c
 void MarketDataService::flush_batch() {
     batch_scheduled_ = false;
 
+    if (quote_fetch_in_progress_) {
+        if (!pending_.isEmpty() && !batch_scheduled_) {
+            batch_scheduled_ = true;
+            QTimer::singleShot(250, this, &MarketDataService::flush_batch);
+        }
+        return;
+    }
+
     if (pending_.isEmpty())
         return;
 
-    // Collect all unique symbols from pending requests
+    // Collect all unique symbols from pending requests. Preserve first-seen
+    // order so logs, Python output, and callback ordering stay deterministic.
     QSet<QString> all_symbols_set;
+    QStringList all_symbols;
     for (const auto& req : pending_) {
         for (const auto& sym : req.symbols) {
-            all_symbols_set.insert(sym);
+            const QString normalized = normalize_symbol(sym);
+            if (normalized.isEmpty() || all_symbols_set.contains(normalized))
+                continue;
+            all_symbols_set.insert(normalized);
+            all_symbols.append(normalized);
         }
     }
-    QStringList all_symbols = all_symbols_set.values();
 
     // Take ownership of pending callbacks
     auto requests = std::move(pending_);
@@ -213,19 +270,21 @@ void MarketDataService::flush_batch() {
     LOG_INFO("MarketData",
              QString("Batch fetch: %1 unique symbols from %2 requests").arg(all_symbols.size()).arg(requests.size()));
 
+    quote_fetch_in_progress_ = true;
+
     QStringList args;
     args << "batch_quotes";
     args.append(all_symbols);
 
     python::PythonRunner::instance().run(
-        "yfinance_data.py", args, [this, requests = std::move(requests)](python::PythonResult result) {
+        "yfinance_data.py", args, [this, all_symbols, requests = std::move(requests)](python::PythonResult result) {
             QVector<QuoteData> all_quotes;
 
             if (result.success) {
                 auto doc = QJsonDocument::fromJson(result.output.toUtf8());
 
                 auto parse_quote = [](const QJsonObject& q) -> QuoteData {
-                    return {q["symbol"].toString(),
+                    QuoteData quote{normalize_symbol(q["symbol"].toString()),
                             q["name"].toString(q["symbol"].toString()),
                             q["price"].toDouble(),
                             q["change"].toDouble(),
@@ -233,9 +292,14 @@ void MarketDataService::flush_batch() {
                             q["high"].toDouble(),
                             q["low"].toDouble(),
                             q["volume"].toDouble()};
+                    if (quote.name.trimmed().isEmpty())
+                        quote.name = quote.symbol;
+                    return quote;
                 };
 
                 auto store_quote = [](const QuoteData& q) {
+                    if (!is_valid_quote(q))
+                        return;
                     QJsonObject o;
                     o["symbol"] = q.symbol;
                     o["name"] = q.name;
@@ -257,6 +321,8 @@ void MarketDataService::flush_batch() {
                         if (q.contains("error"))
                             continue;
                         auto quote = parse_quote(q);
+                        if (!is_valid_quote(quote))
+                            continue;
                         all_quotes.append(quote);
                         store_quote(quote);
                         publish_quote_to_hub(quote);
@@ -265,30 +331,49 @@ void MarketDataService::flush_batch() {
                     auto obj = doc.object();
                     if (obj.contains("symbol") && !obj.contains("error")) {
                         auto quote = parse_quote(obj);
-                        all_quotes.append(quote);
-                        store_quote(quote);
-                        publish_quote_to_hub(quote);
+                        if (is_valid_quote(quote)) {
+                            all_quotes.append(quote);
+                            store_quote(quote);
+                            publish_quote_to_hub(quote);
+                        }
                     }
                 }
 
                 LOG_INFO("MarketData", QString("Fetched %1 quotes (cached)").arg(all_quotes.size()));
             } else {
                 LOG_WARN("MarketData", "Batch fetch failed: " + result.error);
+                for (const auto& sym : all_symbols) {
+                    QuoteData cached;
+                    if (load_cached_quote(sym, cached)) {
+                        all_quotes.append(cached);
+                        publish_quote_to_hub(cached);
+                    }
+                }
+            }
+
+            QSet<QString> published_symbols;
+            for (const auto& q : all_quotes)
+                published_symbols.insert(q.symbol);
+
+            // DataHub clears a topic's in-flight flag only when a value is
+            // published. Publish a zero placeholder for symbols that failed or
+            // returned no row so bad/temporarily empty tickers do not keep the
+            // hub stuck in loading forever.
+            for (const auto& sym : all_symbols) {
+                if (!published_symbols.contains(sym))
+                    publish_quote_to_hub({sym, sym, 0, 0, 0, 0, 0, 0});
             }
 
             // Fan out results to each waiting callback, filtered to their requested symbols
             for (const auto& req : requests) {
                 if (!result.success) {
-                    // On failure, try to serve from stale cache (ignoring TTL)
+                    // On failure, try to serve from cache so consumers keep the
+                    // last known good value instead of a fake zero.
                     QVector<QuoteData> stale;
                     for (const auto& sym : req.symbols) {
-                        const QVariant cv = fincept::CacheManager::instance().get("market:" + sym);
-                        if (!cv.isNull()) {
-                            const QJsonObject o = QJsonDocument::fromJson(cv.toString().toUtf8()).object();
-                            stale.append({o["symbol"].toString(), o["name"].toString(), o["price"].toDouble(),
-                                          o["change"].toDouble(), o["change_pct"].toDouble(), o["high"].toDouble(),
-                                          o["low"].toDouble(), o["volume"].toDouble()});
-                        }
+                        QuoteData cached;
+                        if (load_cached_quote(sym, cached))
+                            stale.append(cached);
                     }
                     req.cb(!stale.isEmpty(), stale);
                     continue;
@@ -302,6 +387,12 @@ void MarketDataService::flush_batch() {
                     }
                 }
                 req.cb(true, filtered);
+            }
+
+            quote_fetch_in_progress_ = false;
+            if (!pending_.isEmpty() && !batch_scheduled_) {
+                batch_scheduled_ = true;
+                QTimer::singleShot(0, this, &MarketDataService::flush_batch);
             }
         });
 }
@@ -496,12 +587,12 @@ QVector<MarketCategory> MarketDataService::default_global_markets() {
           "GBPJPY=X", "USDCNY=X", "USDINR=X"}},
         {"Commodities",
          {"GC=F", "SI=F", "PL=F", "PA=F", "HG=F", "CL=F", "BZ=F", "NG=F", "RB=F", "HO=F", "ZC=F", "ZW=F", "ZS=F",
-          "KC=F", "CT=F", "SB=F", "CC=F", "LBS=F"}},
+          "KC=F", "CT=F", "SB=F", "CC=F", "LBR=F"}},
         {"Bonds", {"^TNX", "^TYX", "^IRX", "^FVX", "TLT", "IEF", "SHY", "BND", "AGG", "LQD", "HYG", "JNK"}},
         {"ETFs", {"SPY", "QQQ", "DIA", "EEM", "GLD", "XLK", "XLE", "XLF", "XLV", "VNQ", "IWM", "VTI"}},
         {"Cryptocurrencies",
          {"BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "XRP-USD", "ADA-USD", "DOGE-USD", "LINK-USD", "DOT-USD",
-          "AVAX-USD", "UNI-USD", "ATOM-USD"}},
+          "AVAX-USD", "UNI7083-USD", "ATOM-USD"}},
     };
 }
 

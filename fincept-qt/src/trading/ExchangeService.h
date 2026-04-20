@@ -161,6 +161,9 @@ class ExchangeService : public QObject
     QMutex daemon_mutex_;
     QWaitCondition daemon_response_ready_; // signaled when any response arrives
     bool credentials_sent_to_daemon_ = false;
+    bool daemon_stopping_ = false;
+    int daemon_failure_count_ = 0;
+    qint64 daemon_retry_after_ms_ = 0;
 
     static TickerData parse_ticker(const QJsonObject& j);
     static OrderBookData parse_orderbook(const QJsonObject& j);

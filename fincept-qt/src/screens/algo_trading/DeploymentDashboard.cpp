@@ -140,6 +140,17 @@ QWidget* DeploymentDashboard::build_deployment_card(const AlgoDeployment& d, QWi
                                   .arg(is_paper ? "22,163,74" : "217,119,6"));
     top->addWidget(mode_badge);
 
+    if (!d.account_name.isEmpty()) {
+        auto* acct_badge = new QLabel(d.account_name, card);
+        acct_badge->setStyleSheet(QString("color: %1; font-size: %2px; %3"
+                                          " padding: 2px 6px; background: rgba(0,229,255,0.06);"
+                                          " border: 1px solid rgba(0,229,255,0.18);")
+                                      .arg(fincept::ui::colors::CYAN())
+                                      .arg(fincept::ui::fonts::TINY)
+                                      .arg(kMonoFont()));
+        top->addWidget(acct_badge);
+    }
+
     top->addStretch();
 
     // Status badge with dot prefix

@@ -6,6 +6,7 @@
 
 #include <QMutex>
 #include <QThread>
+#include <QTimer>
 
 #include <atomic>
 #include <optional>
@@ -59,12 +60,16 @@ class UnifiedTrading : public QObject {
     // Account-aware helpers
     UnifiedOrderResponse place_paper_order_for_account(const QString& account_id, const UnifiedOrder& order);
     UnifiedOrderResponse place_live_order_for_account(const QString& account_id, const UnifiedOrder& order);
+    void poll_order_signals();
+    void reconcile_submitted_order_signals();
 
     std::optional<TradingSession> session_;
     mutable QMutex mutex_;
 
     // Order bridge
     std::atomic<bool> bridge_running_{false};
+    QTimer* bridge_timer_ = nullptr;
+    qint64 last_reconcile_ms_ = 0;
 };
 
 } // namespace fincept::trading

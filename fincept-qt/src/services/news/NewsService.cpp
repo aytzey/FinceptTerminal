@@ -22,6 +22,7 @@
 #include <QRegularExpression>
 #include <QSet>
 #include <QTimer>
+#include <QUrl>
 #include <QXmlStreamReader>
 #include <QtConcurrent>
 
@@ -83,6 +84,57 @@ QString strip_html_blocks(QString html) {
     html.remove(style_re);
     html.replace(tag_re, " ");
     return decode_html_entities(html).simplified();
+}
+
+QString normalized_article_url(const QString& raw_url) {
+    QUrl url(raw_url.trimmed());
+    if (!url.isValid() || url.host().isEmpty()) {
+        QString fallback = raw_url.trimmed();
+        fallback.remove(QRegularExpression(R"([?#].*$)"));
+        fallback.remove(QRegularExpression(R"(/+$)"));
+        return fallback.toLower();
+    }
+
+    QString host = url.host().toLower();
+    if (host.startsWith(QStringLiteral("www.")))
+        host = host.mid(4);
+
+    QString path = url.path();
+    path.remove(QRegularExpression(R"(/+$)"));
+    return host + path.toLower();
+}
+
+QString normalized_article_headline(QString headline) {
+    headline = strip_html_blocks(headline).toLower().simplified();
+    headline.remove(QRegularExpression(R"(\s+-\s+[^-]{2,80}$)"));
+    headline.remove(QRegularExpression(R"([^\p{L}\p{N}\s])"));
+    return headline.simplified();
+}
+
+QVector<NewsArticle> dedupe_articles(const QVector<NewsArticle>& articles) {
+    QVector<NewsArticle> out;
+    QSet<QString> seen_urls;
+    QSet<QString> seen_headlines;
+    out.reserve(articles.size());
+
+    for (const auto& article : articles) {
+        const QString headline_key = normalized_article_headline(article.headline);
+        if (headline_key.isEmpty())
+            continue;
+
+        const QString url_key = normalized_article_url(article.link);
+        if (!url_key.isEmpty() && seen_urls.contains(url_key))
+            continue;
+        if (seen_headlines.contains(headline_key))
+            continue;
+
+        if (!url_key.isEmpty())
+            seen_urls.insert(url_key);
+        seen_headlines.insert(headline_key);
+        out.append(article);
+    }
+
+    return out;
 }
 
 ArticleSnapshot fetch_article_snapshot(QNetworkAccessManager* nam, const QString& url) {
@@ -378,6 +430,8 @@ QJsonObject article_to_cache_json(const NewsArticle& article) {
 }
 
 void cache_news_articles(const QVector<NewsArticle>& articles) {
+    if (articles.isEmpty())
+        return;
     QJsonArray arr;
     for (const auto& article : articles)
         arr.append(article_to_cache_json(article));
@@ -433,9 +487,12 @@ void NewsService::fetch_all_news(bool force, ArticlesCallback cb) {
                     a.tickers << t.toString();
                 articles.append(a);
             }
-            cb(true, articles);
-            publish_articles_to_hub(articles);
-            return;
+            if (!articles.isEmpty()) {
+                articles = dedupe_articles(articles);
+                cb(true, articles);
+                publish_articles_to_hub(articles);
+                return;
+            }
         }
     }
 
@@ -481,7 +538,7 @@ void NewsService::fetch_all_news(bool force, ArticlesCallback cb) {
 
             if (state->remaining.fetchAndSubRelaxed(1) == 1) {
                 // Last feed done — sort by time descending
-                auto all = state->all_articles;
+                auto all = dedupe_articles(state->all_articles);
                 std::sort(all.begin(), all.end(),
                           [](const NewsArticle& a, const NewsArticle& b) { return a.sort_ts > b.sort_ts; });
 
@@ -539,10 +596,13 @@ void NewsService::fetch_all_news_progressive(bool force, ArticlesCallback final_
                     a.tickers << t.toString();
                 articles.append(a);
             }
-            final_cb(true, articles);
-            emit articles_partial(articles, feed_count_, feed_count_);
-            publish_articles_to_hub(articles);
-            return;
+            if (!articles.isEmpty()) {
+                articles = dedupe_articles(articles);
+                final_cb(true, articles);
+                emit articles_partial(articles, feed_count_, feed_count_);
+                publish_articles_to_hub(articles);
+                return;
+            }
         }
     }
 
@@ -588,7 +648,7 @@ void NewsService::fetch_all_news_progressive(bool force, ArticlesCallback final_
                 state->all_articles.append(batch);
                 feeds_done = state->done.fetchAndAddRelaxed(1) + 1;
                 // Partial snapshot sorted by time for progressive display
-                snapshot = state->all_articles;
+                snapshot = dedupe_articles(state->all_articles);
             }
             std::sort(snapshot.begin(), snapshot.end(),
                       [](const NewsArticle& a, const NewsArticle& b) { return a.sort_ts > b.sort_ts; });
@@ -600,7 +660,7 @@ void NewsService::fetch_all_news_progressive(bool force, ArticlesCallback final_
 
             if (state->remaining.fetchAndSubRelaxed(1) == 1) {
                 // All feeds done — finalize cache
-                auto all = state->all_articles;
+                auto all = dedupe_articles(state->all_articles);
                 std::sort(all.begin(), all.end(),
                           [](const NewsArticle& a, const NewsArticle& b) { return a.sort_ts > b.sort_ts; });
 
@@ -850,6 +910,7 @@ void NewsService::connect_live_feed(const QString& ws_url) {
             }
         }
         updated.prepend(article);
+        updated = dedupe_articles(updated);
 
         QPointer<NewsService> self = this;
         const QString headline = article.headline;
@@ -954,6 +1015,8 @@ QVector<NewsArticle> NewsService::parse_rss_xml(const QByteArray& xml, const RSS
                 // guid/id often contains the article URL as fallback
                 if (text.startsWith("http"))
                     current.link = text.trimmed();
+            } else if (current_tag == "source" && feed.source == QStringLiteral("GOOGLE NEWS")) {
+                current.source = text.left(80).toUpper();
             } else if (current_tag == "pubDate" || current_tag == "published" || current_tag == "updated" ||
                        current_tag == "date") {
                 if (current.sort_ts == 0) {
@@ -1297,6 +1360,18 @@ QString NewsService::source_flag_label(SourceFlag flag) {
 
 QVector<RSSFeed> NewsService::default_feeds() {
     return {
+        // Free fallback feeds — Google News RSS stays useful when vendor RSS
+        // endpoints move, rate-limit, or block desktop clients.
+        {"google-market", "Google Market News",
+         "https://news.google.com/rss/search?q=stock%20market%20OR%20S%26P%20500%20OR%20Nasdaq&hl=en-US&gl=US&ceid=US:en",
+         "MARKETS", "GLOBAL", "GOOGLE NEWS", 2},
+        {"google-business", "Google Business News",
+         "https://news.google.com/rss/search?q=business%20OR%20earnings%20OR%20Federal%20Reserve&hl=en-US&gl=US&ceid=US:en",
+         "MARKETS", "GLOBAL", "GOOGLE NEWS", 2},
+        {"google-crypto", "Google Crypto News",
+         "https://news.google.com/rss/search?q=bitcoin%20OR%20ethereum%20OR%20crypto%20market&hl=en-US&gl=US&ceid=US:en",
+         "CRYPTO", "GLOBAL", "GOOGLE NEWS", 2},
+
         // Tier 1 — Wire Services & Regulators
         {"reuters-world", "Reuters World", "https://feeds.reuters.com/Reuters/worldNews", "GEOPOLITICS", "GLOBAL",
          "REUTERS", 1},
